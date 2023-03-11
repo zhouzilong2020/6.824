@@ -6,24 +6,68 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+)
 
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
+// RequestType is the type of the rpc request
+type RPCType string
 
-type ExampleArgs struct {
-	X int
+const (
+	RPCTypeRegisterWorker  = "Coordinator.RegisterWorker"
+	RPCTypeAssignMapJob    = "Coordinator.AssignMapJob"
+	RPCTypeFinishMapJob    = "Coordinator.FinishMapJob"
+	RPCTypeAssignReduceJob = "Coordinator.AssignReduceJob"
+	RPCTypeFinishReduceJob = "Coordinator.FinishReduceJob"
+	RPCTypeSyncMap         = "Coordinator.SyncMap"
+	RPCTypeSyncReduce      = "Coordinator.SyncReduce"
+)
+
+type Request struct {
+	WorkerId int
+	Payload  []byte
 }
 
-type ExampleReply struct {
-	Y int
+type Status int
+
+const (
+	Success = 200
+	Fail    = 300
+)
+
+type Response struct {
+	Status  Status
+	Payload []byte
 }
 
-// Add your RPC definitions here.
+type ResponsePayloadRegisterWorker struct {
+	WorkerId int
+}
 
+type ResponsePayloadAssignMapJob struct {
+	JobId         int
+	NReduce       int
+	InputFileList []string
+}
+
+type RequestPayloadFinishMapJob struct {
+	InputFileList  []string
+	OutputFileList []string
+}
+
+type ResponsePayloadAssignReduceJob struct {
+	JobId         int
+	HashKey       int
+	NReduce       int
+	InputFileList []string
+}
+
+type RequestPayloadFinishReduceJob struct {
+	JobId      int
+	HashKey    int
+	OutputFile string
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
