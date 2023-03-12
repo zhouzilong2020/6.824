@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io/ioutil"
+	"log"
 	"net/rpc"
 	"os"
 	"sort"
 	"sync"
+	"time"
 )
 
 //
@@ -90,27 +92,33 @@ func Worker(
 ) {
 	// we use the Unix timestamp to id the worker, this may collide, but ignore for now.
 	workerId := os.Getpid()
-	// log.Printf("Worker-%d initiated", workerId)
+	log.Printf("Worker-%d initiated", workerId)
 
 	// ask for a map task  (a split of file).
 	{
 		rsp := CallAssignMapJob(workerId)
-		for len(rsp.InputFileList) > 0 {
+		for rsp.JobId != -1 {
+			if rsp.JobId == 0 {
+				time.Sleep(3 * time.Second)
+				rsp = CallAssignMapJob(workerId)
+				continue
+			}
+
 			intermediate := []KeyValue{}
 			for _, filename := range rsp.InputFileList {
-				// log.Printf("Parsing %v", filename)
+				log.Printf("Parsing %v", filename)
 				file, err := os.Open(filename)
 				if err != nil {
-					// log.Fatalf("cannot open %v", filename)
+					log.Fatalf("cannot open %v", filename)
 				}
 				content, err := ioutil.ReadAll(file)
 				if err != nil {
-					// log.Fatalf("cannot read %v", filename)
+					log.Fatalf("cannot read %v", filename)
 				}
 				file.Close()
 				kva := mapf(filename, string(content))
 				intermediate = append(intermediate, kva...)
-				// log.Printf("Successfully finish parsing %v", filename)
+				log.Printf("Successfully finish parsing %v", filename)
 			}
 			sort.Sort(ByKey(intermediate))
 			// dump to local file.
@@ -118,7 +126,7 @@ func Worker(
 
 			if ok := CallFinishMapJob(workerId, rsp.JobId, rsp.InputFileList, oFileNameList); !ok {
 				// TODO : retry here
-				// log.Fatal("Fail to CallFinishJob, exit.")
+				log.Fatal("Fail to CallFinishJob, exit.")
 			}
 
 			// try to ask for more job.
@@ -132,7 +140,13 @@ func Worker(
 	// try to ask for more job.
 	{
 		rsp := CallAssignReduceJob(workerId)
-		for rsp.HashKey != -1 {
+		for rsp.JobId != -1 {
+			if rsp.JobId == 0 {
+				time.Sleep(3 * time.Second)
+				rsp = CallAssignReduceJob(workerId)
+				continue
+			}
+
 			result := make(map[string][]string)
 			for _, filename := range rsp.InputFileList {
 				intermediate := readFromFile(filename)
@@ -167,7 +181,7 @@ func Worker(
 
 			if ok := CallFinishReduceJob(workerId, rsp.HashKey, rsp.JobId, name); !ok {
 				// TODO : retry here?
-				// log.Fatal("Fail to CallFinishJob, exit.")
+				log.Fatal("Fail to CallFinishJob, exit.")
 			}
 			rsp = CallAssignReduceJob(workerId)
 		}
@@ -202,11 +216,11 @@ func CallFinishMapJob(workerId int, jobId int, inputFileList, outputFileList []s
 	rsp := Response{}
 
 	if ok := call(RPCTypeFinishMapJob, &req, &rsp); ok {
-		// log.Printf("Response from %v, response: %v", RPCTypeFinishMapJob, rsp)
+		log.Printf("Response from %v, response: %v", RPCTypeFinishMapJob, rsp)
 		return rsp.Status == Success
 	}
 
-	// log.Printf("[%v] failed", RPCTypeFinishMapJob)
+	log.Printf("[%v] failed", RPCTypeFinishMapJob)
 	return false
 }
 
@@ -225,11 +239,11 @@ func CallFinishReduceJob(workerId int, hashKey int, jobId int, outputFile string
 	rsp := Response{}
 
 	if ok := call(RPCTypeFinishReduceJob, &req, &rsp); ok {
-		// log.Printf("Response from %v, response: %v", RPCTypeFinishReduceJob, rsp)
+		log.Printf("Response from %v, response: %v", RPCTypeFinishReduceJob, rsp)
 		return rsp.Status == Success
 	}
 
-	// log.Printf("%v failed", RPCTypeFinishReduceJob)
+	log.Printf("%v failed", RPCTypeFinishReduceJob)
 	return false
 }
 
@@ -243,14 +257,14 @@ func CallAssignMapJob(workerId int) *ResponsePayloadAssignMapJob {
 	if ok := call(RPCTypeAssignMapJob, &req, &rsp); ok {
 		var payload ResponsePayloadAssignMapJob
 		if err := json.Unmarshal([]byte(rsp.Payload), &payload); err != nil {
-			// log.Fatalf("Error in Unmarshal payload, err: %v", err)
+			log.Fatalf("Error in Unmarshal payload, err: %v", err)
 		}
 
-		// log.Printf("Response from %v, response %v", RPCTypeAssignMapJob, payload)
+		log.Printf("Response from %v, response %v", RPCTypeAssignMapJob, payload)
 		return &payload
 	}
 
-	// log.Printf("%v failed", RPCTypeAssignMapJob)
+	log.Printf("%v failed", RPCTypeAssignMapJob)
 	return nil
 }
 
@@ -264,14 +278,14 @@ func CallAssignReduceJob(workerId int) *ResponsePayloadAssignReduceJob {
 	if ok := call(RPCTypeAssignReduceJob, &req, &rsp); ok {
 		var payload ResponsePayloadAssignReduceJob
 		if err := json.Unmarshal([]byte(rsp.Payload), &payload); err != nil {
-			// log.Printf("Error in Unmarshal payload, err: %v", err)
+			log.Printf("Error in Unmarshal payload, err: %v", err)
 		}
 
-		// log.Printf("Response from %v, response %v", RPCTypeAssignReduceJob, payload.HashKey)
+		log.Printf("Response from %v, response %v", RPCTypeAssignReduceJob, payload.HashKey)
 		return &payload
 	}
 
-	// log.Printf("%v failed", RPCTypeAssignReduceJob)
+	log.Printf("%v failed", RPCTypeAssignReduceJob)
 	return nil
 }
 
@@ -285,7 +299,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		// log.Fatal("dialing:", err)
+		log.Fatal("dialing:", err)
 	}
 	defer c.Close()
 

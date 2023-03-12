@@ -10,9 +10,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
-var id int = -1
+var id int = 0
 
 func getIncrId() int {
 	id++
@@ -24,13 +25,15 @@ type Coordinator struct {
 	nReduce int
 	files   []string
 
-	mapAssignment  map[string]int  // file -> workerId
-	mapIsFinished  map[string]bool // file -> isFinished
+	mapAssignment  map[string]int       // file -> workerId
+	mapIsFinished  map[string]bool      // file -> isFinished
+	mapAssignedTs  map[string]time.Time // file -> Assigned Ts
 	mapResultFiles []string
 	mapIsDone      bool
 
-	reduceAssignment  map[int]int  // hashKey -> workerId
-	reduceIsFinished  map[int]bool // hashKey -> isFinished
+	reduceAssignment  map[int]int       // hashKey -> workerId
+	reduceIsFinished  map[int]bool      // hashKey -> isFinished
+	reduceAssignedTs  map[int]time.Time // hashKey -> Assigned Ts
 	reduceResultFiles []string
 	reduceIsDone      bool
 
@@ -60,13 +63,17 @@ func (c *Coordinator) AssignMapJob(req *Request, rsp *Response) error {
 		if val, ok := c.mapIsFinished[fileName]; ok && val {
 			continue
 		}
-		// the file has been assigned to a worker
-		if _, ok := c.mapAssignment[fileName]; ok {
+		// the job has been assigned for 10s, still no reading, try to assigned to another
+		if createdTs, ok := c.mapAssignedTs[fileName]; ok && time.Since(createdTs).Seconds() < 12. {
 			continue
+		} else if ok {
+			log.Printf("reassign %v to worker-%v from worker-%d", fileName, req.WorkerId, c.mapAssignment[fileName])
 		}
+
 		jid := getIncrId()
 		log.Printf("Assigned %v as job-%d to worker-%d", fileName, jid, req.WorkerId)
 		c.mapAssignment[fileName] = req.WorkerId
+		c.mapAssignedTs[fileName] = time.Now()
 		rsp.Payload, _ = json.Marshal(
 			ResponsePayloadAssignMapJob{
 				JobId:         jid,
@@ -74,16 +81,25 @@ func (c *Coordinator) AssignMapJob(req *Request, rsp *Response) error {
 				InputFileList: []string{fileName},
 			},
 		)
-
 		rsp.Status = Success
 		return nil
 	}
 
-	// no more task to assign, worker should stop requesting job.
+	if c.mapIsDone {
+		rsp.Payload, _ = json.Marshal(
+			ResponsePayloadAssignMapJob{
+				JobId:   -1,
+				NReduce: 0,
+			},
+		)
+		return nil
+	}
+
+	// no more task to assign. Workers should continue to ask for job in case of some job crash.
 	rsp.Status = Success
 	rsp.Payload, _ = json.Marshal(
 		ResponsePayloadAssignMapJob{
-			JobId:   -1,
+			JobId:   0,
 			NReduce: 0,
 		},
 	)
@@ -100,6 +116,7 @@ func (c *Coordinator) FinishMapJob(req *Request, rsp *Response) error {
 	for _, file := range payload.InputFileList {
 		c.mapIsFinished[file] = true
 		delete(c.mapAssignment, file)
+		delete(c.mapAssignedTs, file)
 		log.Printf("%s finished", file)
 	}
 	c.mapResultFiles = append(c.mapResultFiles, payload.OutputFileList...)
@@ -147,9 +164,11 @@ func (c *Coordinator) AssignReduceJob(req *Request, rsp *Response) error {
 		if val, ok := c.reduceIsFinished[i]; ok && val {
 			continue
 		}
-		// the file has been assigned to a worker
-		if _, ok := c.reduceAssignment[i]; ok {
+		// the job has been assigned for 12s, still no reading, try to assigned to another
+		if createdTs, ok := c.reduceAssignedTs[i]; ok && time.Since(createdTs).Seconds() < 12. {
 			continue
+		} else if ok {
+			log.Printf("reassign %v to worker-%v from worker-%d", i, req.WorkerId, c.reduceAssignedTs[i])
 		}
 
 		jid := getIncrId()
@@ -175,11 +194,22 @@ func (c *Coordinator) AssignReduceJob(req *Request, rsp *Response) error {
 		return nil
 	}
 
-	// no more task to assign, worker should stop requesting job.
+	if c.reduceIsDone {
+		rsp.Payload, _ = json.Marshal(
+			ResponsePayloadAssignReduceJob{
+				JobId:   -1,
+				HashKey: -1,
+				NReduce: 0,
+			},
+		)
+		return nil
+	}
+
+	// no more task to assign
 	rsp.Status = Success
 	rsp.Payload, _ = json.Marshal(
 		ResponsePayloadAssignReduceJob{
-			JobId:   -1,
+			JobId:   0,
 			HashKey: -1,
 			NReduce: 0,
 		},
@@ -198,6 +228,7 @@ func (c *Coordinator) FinishReduceJob(req *Request, rsp *Response) error {
 	c.reduceResultFiles = append(c.reduceResultFiles, payload.OutputFile)
 	c.reduceIsFinished[payload.HashKey] = true
 	delete(c.reduceAssignment, payload.HashKey)
+	delete(c.reduceAssignedTs, payload.HashKey)
 
 	if c.nReduce == len(c.reduceResultFiles) {
 		c.reduceIsDone = true
@@ -262,8 +293,10 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 		mapIsFinished:    make(map[string]bool),
 		mapAssignment:    make(map[string]int),
+		mapAssignedTs:    make(map[string]time.Time),
 		reduceIsFinished: make(map[int]bool),
 		reduceAssignment: make(map[int]int),
+		reduceAssignedTs: make(map[int]time.Time),
 	}
 	c.mapCond = sync.NewCond(c.mu)
 	c.reduceCond = sync.NewCond(c.mu)
