@@ -11,3 +11,15 @@ git clone git://g.csail.mit.edu/6.5840-golabs-2023 lab2023
 ### Lab
 
 Summary: 4 labs for practice.
+
+
+### Status
+- [X] lab1: Map Reduce with fail recovery
+- [ ] lab2A
+- [ ] lab2B
+- [ ] lab2C
+- [ ] lab2D
+- [ ] lab3A
+- [ ] lab3B
+- [ ] lab4A
+- [ ] lab4B
