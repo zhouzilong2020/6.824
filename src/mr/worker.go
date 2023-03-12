@@ -9,6 +9,8 @@ import (
 	"net/rpc"
 	"os"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -37,6 +39,8 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+const tmpDir string = "./tmp"
+
 // dump2File dump intermediate map result to local file.
 func dump2File(intermediate []KeyValue, jobId int, nReduce int) []string {
 	nReduceKey := make([][]KeyValue, nReduce)
@@ -45,18 +49,22 @@ func dump2File(intermediate []KeyValue, jobId int, nReduce int) []string {
 		nReduceKey[hash] = append(nReduceKey[hash], kv)
 	}
 
+	os.Mkdir(tmpDir, 0777)
 	fileList := make([]string, 0)
 	wg := sync.WaitGroup{}
 	for i := 0; i < nReduce; i++ {
 		if len(nReduceKey[i]) == 0 {
 			continue
 		}
-		name := fmt.Sprintf("mr-%v-%v", jobId, i)
+		name := fmt.Sprintf("%s/mr-%v-%v", tmpDir, jobId, i)
 		fileList = append(fileList, name)
 		wg.Add(1)
 		go func(name string, kvList []KeyValue) {
 			defer wg.Done()
-			fd, _ := os.Create(name)
+			fd, err := os.Create(name)
+			if err != nil {
+				log.Fatalf("fail to create file %v, err %v", name, err)
+			}
 			defer fd.Close()
 			enc := json.NewEncoder(fd)
 			for _, kv := range kvList {
@@ -85,210 +93,6 @@ func readFromFile(name string) []KeyValue {
 	return kva
 }
 
-// main/mrworker.go calls this function.
-func Worker(
-	mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string,
-) {
-	// we use the Unix timestamp to id the worker, this may collide, but ignore for now.
-	workerId := os.Getpid()
-	log.Printf("Worker-%d initiated", workerId)
-
-	// ask for a map task  (a split of file).
-	{
-		rsp := CallAssignMapJob(workerId)
-		for rsp.JobId != -1 {
-			if rsp.JobId == 0 {
-				time.Sleep(3 * time.Second)
-				rsp = CallAssignMapJob(workerId)
-				continue
-			}
-
-			intermediate := []KeyValue{}
-			for _, filename := range rsp.InputFileList {
-				log.Printf("Parsing %v", filename)
-				file, err := os.Open(filename)
-				if err != nil {
-					log.Fatalf("cannot open %v", filename)
-				}
-				content, err := ioutil.ReadAll(file)
-				if err != nil {
-					log.Fatalf("cannot read %v", filename)
-				}
-				file.Close()
-				kva := mapf(filename, string(content))
-				intermediate = append(intermediate, kva...)
-				log.Printf("Successfully finish parsing %v", filename)
-			}
-			sort.Sort(ByKey(intermediate))
-			// dump to local file.
-			oFileNameList := dump2File(intermediate, rsp.JobId, rsp.NReduce)
-
-			if ok := CallFinishMapJob(workerId, rsp.JobId, rsp.InputFileList, oFileNameList); !ok {
-				// TODO : retry here
-				log.Fatal("Fail to CallFinishJob, exit.")
-			}
-
-			// try to ask for more job.
-			rsp = CallAssignMapJob(workerId)
-		}
-	}
-
-	// wait for all map task to finish.
-	CallSync(workerId, RPCTypeSyncMap)
-
-	// try to ask for more job.
-	{
-		rsp := CallAssignReduceJob(workerId)
-		for rsp.JobId != -1 {
-			if rsp.JobId == 0 {
-				time.Sleep(3 * time.Second)
-				rsp = CallAssignReduceJob(workerId)
-				continue
-			}
-
-			result := make(map[string][]string)
-			for _, filename := range rsp.InputFileList {
-				intermediate := readFromFile(filename)
-				i := 0
-				for i < len(intermediate) {
-					j := i + 1
-					key := intermediate[i].Key
-					for j < len(intermediate) && intermediate[j].Key == key {
-						j++
-					}
-					values := []string{}
-					for k := i; k < j; k++ {
-						values = append(values, intermediate[k].Value)
-					}
-					result[key] = append(result[key], values...)
-					i = j
-				}
-			}
-
-			kvList := make([]KeyValue, 0)
-			for k, v := range result {
-				kvList = append(kvList, KeyValue{k, reducef(k, v)})
-			}
-			sort.Sort(ByKey(kvList))
-
-			name := fmt.Sprintf("mr-out-%v.txt", rsp.HashKey)
-			fd, _ := os.Create(name)
-			for _, kv := range kvList {
-				fmt.Fprintf(fd, "%v %v\n", kv.Key, kv.Value)
-			}
-			fd.Close()
-
-			if ok := CallFinishReduceJob(workerId, rsp.HashKey, rsp.JobId, name); !ok {
-				// TODO : retry here?
-				log.Fatal("Fail to CallFinishJob, exit.")
-			}
-			rsp = CallAssignReduceJob(workerId)
-		}
-	}
-
-	// wait for all map task to finish.
-	CallSync(workerId, RPCTypeSyncReduce)
-}
-
-// CallSync calls Sync defined in coordinator.
-func CallSync(workerId int, syncType RPCType) {
-	req := Request{
-		WorkerId: workerId,
-	}
-	rsp := Response{}
-
-	call(string(syncType), &req, &rsp)
-}
-
-// CallFinishJob calls FinishJob defined in coordinator.
-func CallFinishMapJob(workerId int, jobId int, inputFileList, outputFileList []string) bool {
-	req := Request{
-		WorkerId: workerId,
-	}
-	req.Payload, _ = json.Marshal(
-		RequestPayloadFinishMapJob{
-			JobId:          jobId,
-			InputFileList:  inputFileList,
-			OutputFileList: outputFileList,
-		},
-	)
-	rsp := Response{}
-
-	if ok := call(RPCTypeFinishMapJob, &req, &rsp); ok {
-		log.Printf("Response from %v, response: %v", RPCTypeFinishMapJob, rsp)
-		return rsp.Status == Success
-	}
-
-	log.Printf("[%v] failed", RPCTypeFinishMapJob)
-	return false
-}
-
-// CallFinishJob calls FinishJob defined in coordinator.
-func CallFinishReduceJob(workerId int, hashKey int, jobId int, outputFile string) bool {
-	req := Request{
-		WorkerId: workerId,
-	}
-	req.Payload, _ = json.Marshal(
-		RequestPayloadFinishReduceJob{
-			JobId:      jobId,
-			HashKey:    hashKey,
-			OutputFile: outputFile,
-		},
-	)
-	rsp := Response{}
-
-	if ok := call(RPCTypeFinishReduceJob, &req, &rsp); ok {
-		log.Printf("Response from %v, response: %v", RPCTypeFinishReduceJob, rsp)
-		return rsp.Status == Success
-	}
-
-	log.Printf("%v failed", RPCTypeFinishReduceJob)
-	return false
-}
-
-// CallAssignMapJob calls AssignMapJob defined in coordinator.
-func CallAssignMapJob(workerId int) *ResponsePayloadAssignMapJob {
-	req := Request{
-		WorkerId: workerId,
-	}
-	rsp := Response{}
-
-	if ok := call(RPCTypeAssignMapJob, &req, &rsp); ok {
-		var payload ResponsePayloadAssignMapJob
-		if err := json.Unmarshal([]byte(rsp.Payload), &payload); err != nil {
-			log.Fatalf("Error in Unmarshal payload, err: %v", err)
-		}
-
-		log.Printf("Response from %v, response %v", RPCTypeAssignMapJob, payload)
-		return &payload
-	}
-
-	log.Printf("%v failed", RPCTypeAssignMapJob)
-	return nil
-}
-
-// CallAssignReduceJob calls AssignReduceJob defined in coordinator.
-func CallAssignReduceJob(workerId int) *ResponsePayloadAssignReduceJob {
-	req := Request{
-		WorkerId: workerId,
-	}
-	rsp := Response{}
-
-	if ok := call(RPCTypeAssignReduceJob, &req, &rsp); ok {
-		var payload ResponsePayloadAssignReduceJob
-		if err := json.Unmarshal([]byte(rsp.Payload), &payload); err != nil {
-			log.Printf("Error in Unmarshal payload, err: %v", err)
-		}
-
-		log.Printf("Response from %v, response %v", RPCTypeAssignReduceJob, payload.HashKey)
-		return &payload
-	}
-
-	log.Printf("%v failed", RPCTypeAssignReduceJob)
-	return nil
-}
-
 //
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
@@ -310,4 +114,136 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 
 	fmt.Println(err)
 	return false
+}
+
+func CallAskForJob(workerId int) *Job {
+	req := Request{
+		WorkerId: workerId,
+	}
+	rsp := Response{}
+
+	if ok := call(RPCTypeAskForJob, &req, &rsp); ok {
+		var job Job
+		_ = json.Unmarshal(rsp.Payload, &job)
+		return &job
+	}
+
+	log.Fatalf("RPC call failed, type: %v", RPCTypeAskForJob)
+	return nil
+}
+
+func CallSubmitJob(workerId int, jobId int) bool {
+	req := Request{
+		WorkerId: workerId,
+	}
+	req.Payload, _ = json.Marshal(RequestPayloadSubmitJob{JobId: jobId})
+	rsp := Response{}
+
+	if ok := call(RPCTypeSubmitJob, &req, &rsp); ok {
+		return rsp.Status == Success
+	}
+
+	log.Fatalf("RPC call failed, type: %v", RPCTypeSubmitJob)
+	return false
+}
+
+// main/mrworker.go calls this function.
+func Worker(
+	mapf func(string, string) []KeyValue,
+	reducef func(string, []string) string,
+) {
+	workerId := os.Getpid()
+	log.Printf("Worker-%d initiated", workerId)
+
+	for {
+		job := CallAskForJob(workerId)
+		if job.Type == JobTypeWait {
+			time.Sleep(3 * time.Second)
+		} else if job.Type == JobTypeMap {
+			intermediate := []KeyValue{}
+			var payload PayloadJobMap
+			_ = json.Unmarshal(job.Payload, &payload)
+			for _, file := range payload.InputFileList {
+				fd, err := os.Open(file)
+				if err != nil {
+					log.Fatalf("job-%d cannot open %v", job.JobId, file)
+				}
+				content, err := ioutil.ReadAll(fd)
+				if err != nil {
+					log.Fatalf("job-%d cannot read %v", job.JobId, file)
+				}
+				fd.Close()
+				kva := mapf(file, string(content))
+				intermediate = append(intermediate, kva...)
+			}
+			sort.Sort(ByKey(intermediate))
+			outputFileList := dump2File(intermediate, job.JobId, payload.Partition)
+			if ok := CallSubmitJob(workerId, job.JobId); !ok {
+				log.Printf("Fail submit job-%d, deleting output file", job.JobId)
+				for _, file := range outputFileList {
+					os.Remove(file)
+				}
+			}
+		} else if job.Type == JobTypeReduce {
+			var payload PayloadJobReduce
+			_ = json.Unmarshal(job.Payload, &payload)
+			outputFileList := make([]string, 0)
+			for _, hashKey := range payload.HashKeyList {
+				dirList, _ := os.ReadDir(tmpDir)
+				fileList := make([]string, 0)
+				for _, fd := range dirList {
+					if fd.IsDir() {
+						continue
+					}
+					key, _ := strconv.ParseInt(strings.Split(fd.Name(), "-")[2], 10, 64)
+					if int(key) != hashKey {
+						continue
+					}
+					fileList = append(fileList, fmt.Sprintf("%s/%s", tmpDir, fd.Name()))
+				}
+				result := make(map[string][]string)
+				for _, file := range fileList {
+					intermediate := readFromFile(file)
+					i := 0
+					for i < len(intermediate) {
+						j := i + 1
+						key := intermediate[i].Key
+						for j < len(intermediate) && intermediate[j].Key == key {
+							j++
+						}
+						values := []string{}
+						for k := i; k < j; k++ {
+							values = append(values, intermediate[k].Value)
+						}
+						result[key] = append(result[key], values...)
+						i = j
+					}
+				}
+				kvList := make([]KeyValue, 0)
+				for k, v := range result {
+					kvList = append(kvList, KeyValue{k, reducef(k, v)})
+				}
+				sort.Sort(ByKey(kvList))
+
+				name := fmt.Sprintf("mr-out-%v.txt", hashKey)
+				fd, _ := os.Create(name)
+				for _, kv := range kvList {
+					fmt.Fprintf(fd, "%v %v\n", kv.Key, kv.Value)
+				}
+				fd.Close()
+				outputFileList = append(outputFileList, name)
+			}
+
+			if ok := CallSubmitJob(workerId, job.JobId); !ok {
+				log.Printf("Fail submit job-%d, deleting output file", job.JobId)
+				for _, file := range outputFileList {
+					os.Remove(file)
+				}
+			}
+		} else if job.Type == JobTypeTerminate {
+			os.RemoveAll(tmpDir)
+			return
+		}
+	}
+
 }

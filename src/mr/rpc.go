@@ -15,18 +15,18 @@ import (
 type RPCType string
 
 const (
-	RPCTypeRegisterWorker  = "Coordinator.RegisterWorker"
-	RPCTypeAssignMapJob    = "Coordinator.AssignMapJob"
-	RPCTypeFinishMapJob    = "Coordinator.FinishMapJob"
-	RPCTypeAssignReduceJob = "Coordinator.AssignReduceJob"
-	RPCTypeFinishReduceJob = "Coordinator.FinishReduceJob"
-	RPCTypeSyncMap         = "Coordinator.SyncMap"
-	RPCTypeSyncReduce      = "Coordinator.SyncReduce"
+	RPCTypeAskForJob = "Coordinator.AskForJob"
+	RPCTypeSubmitJob = "Coordinator.SubmitJob"
 )
 
 type Request struct {
 	WorkerId int
 	Payload  []byte
+}
+
+type RequestPayloadSubmitJob struct {
+	JobId          int
+	OutputFileList []string
 }
 
 type Status int
@@ -39,35 +39,6 @@ const (
 type Response struct {
 	Status  Status
 	Payload []byte
-}
-
-type ResponsePayloadRegisterWorker struct {
-	WorkerId int
-}
-
-type ResponsePayloadAssignMapJob struct {
-	JobId         int
-	NReduce       int
-	InputFileList []string
-}
-
-type RequestPayloadFinishMapJob struct {
-	JobId          int
-	InputFileList  []string
-	OutputFileList []string
-}
-
-type ResponsePayloadAssignReduceJob struct {
-	JobId         int
-	HashKey       int
-	NReduce       int
-	InputFileList []string
-}
-
-type RequestPayloadFinishReduceJob struct {
-	JobId      int
-	HashKey    int
-	OutputFile string
 }
 
 // Cook up a unique-ish UNIX-domain socket name
