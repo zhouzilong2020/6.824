@@ -53,6 +53,7 @@ func dump2File(intermediate []KeyValue, jobId int, nReduce int) []string {
 		fileList = append(fileList, name)
 		wg.Add(1)
 		go func(name string, kvList []KeyValue) {
+			defer wg.Done()
 			fd, _ := os.Create(name)
 			defer fd.Close()
 			enc := json.NewEncoder(fd)
@@ -62,7 +63,7 @@ func dump2File(intermediate []KeyValue, jobId int, nReduce int) []string {
 		}(name, nReduceKey[i])
 	}
 
-	wg.Done()
+	wg.Wait()
 	return fileList
 }
 
@@ -115,7 +116,7 @@ func Worker(
 			// dump to local file.
 			oFileNameList := dump2File(intermediate, rsp.JobId, rsp.NReduce)
 
-			if ok := CallFinishMapJob(workerId, rsp.InputFileList, oFileNameList); !ok {
+			if ok := CallFinishMapJob(workerId, rsp.JobId, rsp.InputFileList, oFileNameList); !ok {
 				// TODO : retry here
 				// log.Fatal("Fail to CallFinishJob, exit.")
 			}
@@ -164,7 +165,7 @@ func Worker(
 			}
 			fd.Close()
 
-			if ok := CallFinishReduceJob(workerId, rsp.HashKey, name); !ok {
+			if ok := CallFinishReduceJob(workerId, rsp.HashKey, rsp.JobId, name); !ok {
 				// TODO : retry here?
 				// log.Fatal("Fail to CallFinishJob, exit.")
 			}
@@ -187,12 +188,13 @@ func CallSync(workerId int, syncType RPCType) {
 }
 
 // CallFinishJob calls FinishJob defined in coordinator.
-func CallFinishMapJob(workerId int, inputFileList, outputFileList []string) bool {
+func CallFinishMapJob(workerId int, jobId int, inputFileList, outputFileList []string) bool {
 	req := Request{
 		WorkerId: workerId,
 	}
 	req.Payload, _ = json.Marshal(
 		RequestPayloadFinishMapJob{
+			JobId:          jobId,
 			InputFileList:  inputFileList,
 			OutputFileList: outputFileList,
 		},
@@ -209,12 +211,13 @@ func CallFinishMapJob(workerId int, inputFileList, outputFileList []string) bool
 }
 
 // CallFinishJob calls FinishJob defined in coordinator.
-func CallFinishReduceJob(workerId int, hashKey int, outputFile string) bool {
+func CallFinishReduceJob(workerId int, hashKey int, jobId int, outputFile string) bool {
 	req := Request{
 		WorkerId: workerId,
 	}
 	req.Payload, _ = json.Marshal(
 		RequestPayloadFinishReduceJob{
+			JobId:      jobId,
 			HashKey:    hashKey,
 			OutputFile: outputFile,
 		},
