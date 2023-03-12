@@ -52,6 +52,7 @@ type ResponsePayloadAssignMapJob struct {
 }
 
 type RequestPayloadFinishMapJob struct {
+	JobId          int
 	InputFileList  []string
 	OutputFileList []string
 }

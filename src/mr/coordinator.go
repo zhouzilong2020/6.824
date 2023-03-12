@@ -65,7 +65,7 @@ func (c *Coordinator) AssignMapJob(req *Request, rsp *Response) error {
 			continue
 		}
 		jid := getIncrId()
-		log.Printf("Assigned %v as job-%d to worker %d", fileName, jid, req.WorkerId)
+		log.Printf("Assigned %v as job-%d to worker-%d", fileName, jid, req.WorkerId)
 		c.mapAssignment[fileName] = req.WorkerId
 		rsp.Payload, _ = json.Marshal(
 			ResponsePayloadAssignMapJob{
@@ -109,6 +109,7 @@ func (c *Coordinator) FinishMapJob(req *Request, rsp *Response) error {
 		c.mapCond.Broadcast()
 	}
 
+	log.Printf("job-%d finished.", payload.JobId)
 	rsp.Status = Success
 	return nil
 }
@@ -117,8 +118,6 @@ func (c *Coordinator) FinishMapJob(req *Request, rsp *Response) error {
 func (c *Coordinator) SyncMap(req *Request, rsp *Response) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	log.Printf("worker-%d called syncMap", req.WorkerId)
-
 	for !c.mapIsDone {
 		c.mapCond.Wait()
 	}
@@ -133,8 +132,6 @@ func (c *Coordinator) SyncMap(req *Request, rsp *Response) error {
 func (c *Coordinator) AssignReduceJob(req *Request, rsp *Response) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	log.Printf("worker-%d called AssignReduceJob, mapList %v", req.WorkerId, len(c.mapResultFiles))
-
 	for i := 0; i < c.nReduce; i++ {
 		// the file has been processed
 		if val, ok := c.reduceIsFinished[i]; ok && val {
@@ -146,7 +143,7 @@ func (c *Coordinator) AssignReduceJob(req *Request, rsp *Response) error {
 		}
 
 		jid := getIncrId()
-		log.Printf("Assigned reduce-%v as job-%d to worker %d", i, jid, req.WorkerId)
+		log.Printf("Assigned reduce-%v as job-%d to worker-%d", i, jid, req.WorkerId)
 		c.reduceAssignment[i] = req.WorkerId
 		inputFileList := make([]string, 0)
 		for _, file := range c.mapResultFiles {
@@ -184,7 +181,6 @@ func (c *Coordinator) AssignReduceJob(req *Request, rsp *Response) error {
 func (c *Coordinator) FinishReduceJob(req *Request, rsp *Response) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	log.Printf("worker-%d called FinishReduceJob", req.WorkerId)
 
 	var payload RequestPayloadFinishReduceJob
 	json.Unmarshal([]byte(req.Payload), &payload)
@@ -198,6 +194,7 @@ func (c *Coordinator) FinishReduceJob(req *Request, rsp *Response) error {
 		c.reduceCond.Broadcast()
 	}
 
+	log.Printf("job-%d finished.", payload.JobId)
 	rsp.Status = Success
 	return nil
 }
@@ -206,7 +203,6 @@ func (c *Coordinator) FinishReduceJob(req *Request, rsp *Response) error {
 func (c *Coordinator) SyncReduce(req *Request, rsp *Response) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	log.Printf("worker-%d called syncReduce", req.WorkerId)
 
 	for !c.reduceIsDone {
 		c.reduceCond.Wait()
