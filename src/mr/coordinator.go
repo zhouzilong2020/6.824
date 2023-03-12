@@ -104,9 +104,17 @@ func (c *Coordinator) FinishMapJob(req *Request, rsp *Response) error {
 	}
 	c.mapResultFiles = append(c.mapResultFiles, payload.OutputFileList...)
 
-	if len(c.files)*c.nReduce == len(c.mapResultFiles) {
-		c.mapIsDone = true
-		c.mapCond.Broadcast()
+	if len(c.mapIsFinished) == len(c.files) {
+		finishCnt := 0
+		for _, file := range c.files {
+			if val, ok := c.mapIsFinished[file]; ok && val {
+				finishCnt++
+			}
+		}
+		if finishCnt == len(c.files) {
+			c.mapIsDone = true
+			c.mapCond.Broadcast()
+		}
 	}
 
 	log.Printf("job-%d finished.", payload.JobId)
@@ -118,6 +126,8 @@ func (c *Coordinator) FinishMapJob(req *Request, rsp *Response) error {
 func (c *Coordinator) SyncMap(req *Request, rsp *Response) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	log.Printf("worker-%d called sync", req.WorkerId)
+
 	for !c.mapIsDone {
 		c.mapCond.Wait()
 	}
