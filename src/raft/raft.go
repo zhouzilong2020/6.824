@@ -131,22 +131,27 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 
 	reply.VoteGranted = false
-	rf.lastHeartBeat = time.Now()
 	Debug(dVote, "S%d receive vote request from S%d, currently vote for S%v(-1 means none)", rf.me, args.CandidateId, rf.votedFor)
 	if args.Term < rf.currentTerm {
-		// recognized this candidate step down from candidate
-		reply.VoteGranted = true
-	} else if (args.Term >= rf.currentTerm) ||
-		(rf.votedFor == args.CandidateId || rf.votedFor == -1) {
-		// revert to follower
+		// Reply false if term < currentTerm
+		reply.VoteGranted = false
+		reply.Term = rf.currentTerm
+	} else if args.Term > rf.currentTerm ||
+		rf.votedFor == args.CandidateId ||
+		rf.votedFor == -1 {
+		// If votedFor is null or candidateId, and candidate’s log is at
+		// least as up-to-date as receiver’s log, grant vote.
+		// If the args.term is larger than current term, meaning this server can vote for another candidate.
+		// there are should be at most 1 vote for one term.
+		rf.currentTerm = args.Term
 		rf.role = RaftRoleFollower
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
-		rf.currentTerm = args.Term
 	}
 
 	if reply.VoteGranted {
 		Debug(dVote, "S%d vote for S%d", rf.me, args.CandidateId)
+		rf.lastHeartBeat = time.Now()
 	}
 }
 
@@ -156,12 +161,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 
 	rf.lastHeartBeat = time.Now()
-	if args.Term >= rf.currentTerm {
-		// recognize this leader, give up any ongoing election
-		if rf.role == RaftRoleCandidate {
-			rf.role = RaftRoleFollower
-		}
+	reply.Success = true
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+	} else if args.Term > rf.currentTerm {
+		// recognize this leader, give up any ongoing election or its term
+		rf.role = RaftRoleFollower
+		// a new term begin, clear vote
 		rf.currentTerm = args.Term
+		rf.votedFor = -1
 	}
 	reply.Term = rf.currentTerm
 }
@@ -209,19 +217,20 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) ticker() {
 	for !rf.killed() {
-		timeoutMS := 250 + (rand.Int63() % 300)
+		timeoutMS := 100 + (rand.Int63() % 500)
 		rf.mu.Lock()
 		if time.Since(rf.lastHeartBeat).Milliseconds() < timeoutMS {
 			rf.mu.Unlock()
 			time.Sleep(time.Duration(timeoutMS) * time.Millisecond)
 			continue
 		}
-
 		Debug(dVote, "S%d start an election with T%d", rf.me, rf.currentTerm+1)
 		// election timeout, select self as candidate and start an election.
 		rf.role = RaftRoleCandidate
+		rf.lastHeartBeat = time.Now()
 		rf.currentTerm += 1
 		rf.votedFor = rf.me
+		thisTerm := rf.currentTerm
 		rf.mu.Unlock()
 
 		request := &RequestVoteArgs{
@@ -239,6 +248,11 @@ func (rf *Raft) ticker() {
 			go func(e *labrpc.ClientEnd) {
 				if ok := e.Call(RaftRPCRequestVote, request, reply); ok {
 					voteCh <- reply.VoteGranted
+					if reply.Term > rf.currentTerm {
+						rf.currentTerm = reply.Term
+						rf.role = RaftRoleFollower
+						rf.votedFor = -1
+					}
 					return
 				}
 				// fail to hear back from peer.
@@ -277,45 +291,42 @@ func (rf *Raft) ticker() {
 			rf.mu.Unlock()
 			for {
 				heartBeatInterval := 100 * time.Millisecond
-				liveCh := make(chan bool)
 				if rf.role != RaftRoleLeader {
+					Debug(dVote, "S%d no longer a leader", rf.me)
 					break
 				}
 				for idx, peer := range rf.peers {
 					if idx == rf.me {
 						continue
 					}
-					reply := &RequestVoteReply{}
+					reply := &AppendEntriesReply{}
 					go func(e *labrpc.ClientEnd) {
-						liveCh <- e.Call(RaftRPCAppendENtries, request, reply)
+						// the leader will think it self as a leader.
+						if ok := e.Call(RaftRPCAppendENtries, request, reply); ok {
+							if reply.Term > rf.currentTerm {
+								rf.currentTerm = reply.Term
+								rf.votedFor = -1
+								rf.role = RaftRoleFollower
+							}
+						}
+
 					}(peer)
 				}
-
-				liveCnt := 1
-				for i := 1; i < len(rf.peers); i++ {
-					isLive := <-liveCh
-					if isLive {
-						liveCnt += 1
-					}
-				}
-				if liveCnt >= (len(rf.peers)+1)/2 {
-					time.Sleep(heartBeatInterval)
-					continue
-				}
-				break
+				time.Sleep(heartBeatInterval)
 			}
 		} else {
-			Debug(dVote, "S%d does not receive enough votes", rf.me)
+			Debug(dVote, "S%d does not receive enough votes or encounter a larger term number", rf.me)
 		}
 
 		// lose the election or no majority are live, un vote for self.
-		Debug(dVote, "S%d become a follower", rf.me)
 		rf.mu.Lock()
+		// new term begin, clear vote
+		if thisTerm != rf.currentTerm {
+			rf.votedFor = -1
+		}
 		// if there is other heart beat get accepted by this server
-		rf.votedFor = -1
 		rf.role = RaftRoleFollower
 		rf.mu.Unlock()
-
 	}
 }
 

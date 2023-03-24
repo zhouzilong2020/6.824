@@ -30,6 +30,6 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term int // follower's current term, for leader to update itself
-	// Success bool //
+	Term    int // follower's current term, for leader to update itself
+	Success bool
 }
