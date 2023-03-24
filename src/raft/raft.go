@@ -51,13 +51,13 @@ type ApplyMsg struct {
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu           sync.Mutex          // Lock to protect shared access to this peer's state
-	peers        []*labrpc.ClientEnd // RPC end points of all peers
-	persister    *Persister          // Object to hold this peer's persisted state
-	me           int                 // this peer's index into peers[]
-	dead         int32               // set by Kill()
-	role         RaftRole
-	lastHartBeat time.Time
+	mu            sync.Mutex          // Lock to protect shared access to this peer's state
+	peers         []*labrpc.ClientEnd // RPC end points of all peers
+	persister     *Persister          // Object to hold this peer's persisted state
+	me            int                 // this peer's index into peers[]
+	dead          int32               // set by Kill()
+	role          RaftRole
+	lastHeartBeat time.Time
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -130,16 +130,23 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
-	if args.Term >= rf.currentTerm &&
+	rf.lastHeartBeat = time.Now()
+	Debug(dInfo, "s-%d receive vote request from s-%d, currently vote for s-%d", rf.me, args.CandidateId, rf.votedFor)
+	if args.Term < rf.currentTerm {
+		// recognized this candidate step down from candidate
+		reply.VoteGranted = true
+	} else if (args.Term >= rf.currentTerm) ||
 		(rf.votedFor == args.CandidateId || rf.votedFor == -1) {
+		// revert to follower
+		rf.role = RaftRoleFollower
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
 		rf.currentTerm = args.Term
 	}
+
 	if reply.VoteGranted {
-		Debug(dInfo, "server-%d vote for server-%d", rf.me, args.CandidateId)
+		Debug(dInfo, "s-%d vote for s-%d", rf.me, args.CandidateId)
 	}
 }
 
@@ -148,15 +155,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	reply.Term = rf.currentTerm
+	rf.lastHeartBeat = time.Now()
 	if args.Term >= rf.currentTerm {
 		// recognize this leader, give up any ongoing election
 		if rf.role == RaftRoleCandidate {
 			rf.role = RaftRoleFollower
 		}
-
-		rf.lastHartBeat = time.Now()
+		rf.currentTerm = args.Term
 	}
+	reply.Term = rf.currentTerm
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -202,27 +209,19 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) ticker() {
 	for !rf.killed() {
-		timeoutMS := 50 + (rand.Int63() % 300)
-
+		timeoutMS := 250 + (rand.Int63() % 300)
 		rf.mu.Lock()
-		if rf.role == RaftRoleLeader {
+		if time.Since(rf.lastHeartBeat).Milliseconds() < timeoutMS {
 			rf.mu.Unlock()
 			time.Sleep(time.Duration(timeoutMS) * time.Millisecond)
 			continue
 		}
 
-		if time.Since(rf.lastHartBeat).Milliseconds() < timeoutMS {
-			rf.mu.Unlock()
-			time.Sleep(time.Duration(timeoutMS) * time.Millisecond)
-			continue
-		}
-
-		Debug(dInfo, "server-%d start an election", rf.me)
+		Debug(dInfo, "s-%d start an election with t-%d", rf.me, rf.currentTerm+1)
 		// election timeout, select self as candidate and start an election.
 		rf.role = RaftRoleCandidate
 		rf.currentTerm += 1
 		rf.votedFor = rf.me
-		rf.lastHartBeat = time.Now()
 		rf.mu.Unlock()
 
 		request := &RequestVoteArgs{
@@ -247,23 +246,29 @@ func (rf *Raft) ticker() {
 			}(peer)
 		}
 
-		voteCnt := 1 // a vote from self
+		voteCnt := 1 // automatically vote from self
+		disVoteCnt := 0
 		for i := 1; i < len(rf.peers); i++ {
 			isGranted := <-voteCh
 			if isGranted {
 				voteCnt += 1
+			} else {
+				disVoteCnt += 1
+			}
+			if voteCnt >= (len(rf.peers)+1)/2 || disVoteCnt >= (len(rf.peers)+1)/2 {
+				break
 			}
 		}
 
-		if voteCnt >= (len(rf.peers)+1)/2 {
-			Debug(dInfo, "server-%d win an election", rf.me)
-			rf.mu.Lock()
+		if voteCnt >= (len(rf.peers)+1)/2 && rf.role == RaftRoleCandidate {
+			Debug(dInfo, "s-%d win an election with t-%d", rf.me, rf.currentTerm)
 			// TODO (is this true?): It is impossible to have a candidate to win an election and
 			// receive a valid heart beat from a leader. In order to receive a majority vote,
 			// candidate's term must be higher than the majority, and the majority's term should
 			// be at least as high as the current leader.
 			// 1. If this candidate's term is larger than the leader, there can not be a valid heart bead.
 			// 2. If this candidate's term is smaller than the leader, it can not receive a majority vote.
+			rf.mu.Lock()
 			rf.role = RaftRoleLeader
 			request := &AppendEntriesArgs{
 				Term:     rf.currentTerm,
@@ -271,22 +276,46 @@ func (rf *Raft) ticker() {
 			}
 			rf.mu.Unlock()
 			for {
-				heartBeatInterval := 10 * time.Millisecond
+				heartBeatInterval := 100 * time.Millisecond
+				liveCh := make(chan bool)
+				if rf.role != RaftRoleLeader {
+					break
+				}
 				for idx, peer := range rf.peers {
 					if idx == rf.me {
 						continue
 					}
 					reply := &RequestVoteReply{}
 					go func(e *labrpc.ClientEnd) {
-						e.Call(RaftRPCAppendENtries, request, reply)
+						liveCh <- e.Call(RaftRPCAppendENtries, request, reply)
 					}(peer)
 				}
-				time.Sleep(heartBeatInterval)
+
+				liveCnt := 1
+				for i := 1; i < len(rf.peers); i++ {
+					isLive := <-liveCh
+					if isLive {
+						liveCnt += 1
+					}
+				}
+				if liveCnt >= (len(rf.peers)+1)/2 {
+					time.Sleep(heartBeatInterval)
+					continue
+				}
+				break
 			}
 		} else {
-			// lose the election, un vote for self.
-			rf.votedFor = -1
+			Debug(dInfo, "s-%d does not receive enough votes", rf.me)
 		}
+
+		// lose the election or no majority are live, un vote for self.
+		Debug(dInfo, "s-%d become a follower", rf.me)
+		rf.mu.Lock()
+		// if there is other heart beat get accepted by this server
+		rf.votedFor = -1
+		rf.role = RaftRoleFollower
+		rf.mu.Unlock()
+
 	}
 }
 
@@ -307,7 +336,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	rf.role = RaftRoleFollower
 	rf.votedFor = -1
-	rf.lastHartBeat = time.Now()
+	rf.lastHeartBeat = time.Now()
 	rf.currentTerm = 0
 
 	// Your initialization code here (2A, 2B, 2C).
