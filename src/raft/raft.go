@@ -132,7 +132,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	reply.VoteGranted = false
 	rf.lastHeartBeat = time.Now()
-	Debug(dInfo, "s-%d receive vote request from s-%d, currently vote for s-%d", rf.me, args.CandidateId, rf.votedFor)
+	Debug(dVote, "S%d receive vote request from S%d, currently vote for S%v(-1 means none)", rf.me, args.CandidateId, rf.votedFor)
 	if args.Term < rf.currentTerm {
 		// recognized this candidate step down from candidate
 		reply.VoteGranted = true
@@ -146,7 +146,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	if reply.VoteGranted {
-		Debug(dInfo, "s-%d vote for s-%d", rf.me, args.CandidateId)
+		Debug(dVote, "S%d vote for S%d", rf.me, args.CandidateId)
 	}
 }
 
@@ -217,7 +217,7 @@ func (rf *Raft) ticker() {
 			continue
 		}
 
-		Debug(dInfo, "s-%d start an election with t-%d", rf.me, rf.currentTerm+1)
+		Debug(dVote, "S%d start an election with T%d", rf.me, rf.currentTerm+1)
 		// election timeout, select self as candidate and start an election.
 		rf.role = RaftRoleCandidate
 		rf.currentTerm += 1
@@ -261,7 +261,7 @@ func (rf *Raft) ticker() {
 		}
 
 		if voteCnt >= (len(rf.peers)+1)/2 && rf.role == RaftRoleCandidate {
-			Debug(dInfo, "s-%d win an election with t-%d", rf.me, rf.currentTerm)
+			Debug(dVote, "S%d win an election with T%d", rf.me, rf.currentTerm)
 			// TODO (is this true?): It is impossible to have a candidate to win an election and
 			// receive a valid heart beat from a leader. In order to receive a majority vote,
 			// candidate's term must be higher than the majority, and the majority's term should
@@ -305,11 +305,11 @@ func (rf *Raft) ticker() {
 				break
 			}
 		} else {
-			Debug(dInfo, "s-%d does not receive enough votes", rf.me)
+			Debug(dVote, "S%d does not receive enough votes", rf.me)
 		}
 
 		// lose the election or no majority are live, un vote for self.
-		Debug(dInfo, "s-%d become a follower", rf.me)
+		Debug(dVote, "S%d become a follower", rf.me)
 		rf.mu.Lock()
 		// if there is other heart beat get accepted by this server
 		rf.votedFor = -1
