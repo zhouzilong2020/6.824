@@ -27,6 +27,7 @@ func TestInitialElection2A(t *testing.T) {
 	defer cfg.cleanup()
 
 	cfg.begin("Test (2A): initial election")
+	Debug(dTest, "Test (2A): initial election\n")
 
 	// is a leader elected?
 	cfg.checkOneLeader()
@@ -58,6 +59,7 @@ func TestReElection2A(t *testing.T) {
 	defer cfg.cleanup()
 
 	cfg.begin("Test (2A): election after network failure")
+	Debug(dTest, "Test (2A): election after network failure\n")
 
 	leader1 := cfg.checkOneLeader()
 
@@ -102,6 +104,7 @@ func TestManyElections2A(t *testing.T) {
 	defer cfg.cleanup()
 
 	cfg.begin("Test (2A): multiple elections")
+	Debug(dTest, "Test (2A): multiple elections\n")
 
 	cfg.checkOneLeader()
 
