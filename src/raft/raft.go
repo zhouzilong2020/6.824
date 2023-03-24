@@ -51,13 +51,14 @@ type ApplyMsg struct {
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu            sync.Mutex          // Lock to protect shared access to this peer's state
-	peers         []*labrpc.ClientEnd // RPC end points of all peers
-	persister     *Persister          // Object to hold this peer's persisted state
-	me            int                 // this peer's index into peers[]
-	dead          int32               // set by Kill()
-	role          RaftRole
-	lastHeartBeat time.Time
+	mu              sync.Mutex          // Lock to protect shared access to this peer's state
+	peers           []*labrpc.ClientEnd // RPC end points of all peers
+	persister       *Persister          // Object to hold this peer's persisted state
+	me              int                 // this peer's index into peers[]
+	dead            int32               // set by Kill()
+	role            RaftRole
+	lastHeartBeat   time.Time
+	electionTrigger chan bool
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -67,6 +68,12 @@ type Raft struct {
 	currentTerm int
 	votedFor    int
 }
+
+const (
+	heartBeatIntervalMS  = 100
+	electionTimeoutMinMS = 300
+	electionTimeoutMaxMS = 600
+)
 
 // return currentTerm and whether this server
 // believes it is the leader.
@@ -160,7 +167,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.lastHeartBeat = time.Now()
 	reply.Success = true
 	if args.Term < rf.currentTerm {
 		reply.Success = false
@@ -170,6 +176,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// a new term begin, clear vote
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+	} else if args.LeaderId == rf.votedFor {
+		rf.lastHeartBeat = time.Now()
 	}
 	reply.Term = rf.currentTerm
 }
@@ -215,119 +223,126 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) ticker() {
+// timeoutTicker will trigger a election every timeoutMS.
+func (rf *Raft) timeoutTicker(trigger chan bool) {
 	for !rf.killed() {
-		timeoutMS := 100 + (rand.Int63() % 500)
-		rf.mu.Lock()
-		if time.Since(rf.lastHeartBeat).Milliseconds() < timeoutMS {
-			rf.mu.Unlock()
-			time.Sleep(time.Duration(timeoutMS) * time.Millisecond)
-			continue
+		timeoutMS := rand.Int63n(electionTimeoutMaxMS-electionTimeoutMinMS) + electionTimeoutMinMS
+		timeoutMSDuration := time.Duration(timeoutMS) * time.Millisecond
+		time.Sleep(timeoutMSDuration)
+		if time.Since(rf.lastHeartBeat) > timeoutMSDuration &&
+			rf.role != RaftRoleLeader {
+			trigger <- true
 		}
-		Debug(dVote, "S%d start an election with T%d", rf.me, rf.currentTerm+1)
-		// election timeout, select self as candidate and start an election.
-		rf.role = RaftRoleCandidate
-		rf.lastHeartBeat = time.Now()
-		rf.currentTerm += 1
-		rf.votedFor = rf.me
-		thisTerm := rf.currentTerm
-		rf.mu.Unlock()
+	}
+}
 
-		request := &RequestVoteArgs{
-			Term:         rf.currentTerm,
-			CandidateId:  rf.me,
-			LastLogIndex: -1,
-			LastLogTerm:  -1,
-		}
-		voteCh := make(chan bool)
-		for idx, peer := range rf.peers {
-			if idx == rf.me {
+// runElection will run a new election when receive a trigger.
+func (rf *Raft) runElection(trigger chan bool) {
+	for !rf.killed() {
+		if <-trigger {
+			Debug(dVote, "S%d election timeout\n", rf.me)
+			if rf.role == RaftRoleLeader || rf.killed() {
 				continue
 			}
-			reply := &RequestVoteReply{}
-			go func(e *labrpc.ClientEnd) {
-				if ok := e.Call(RaftRPCRequestVote, request, reply); ok {
-					voteCh <- reply.VoteGranted
-					if reply.Term > rf.currentTerm {
-						rf.currentTerm = reply.Term
-						rf.role = RaftRoleFollower
-						rf.votedFor = -1
-					}
-					return
-				}
-				// fail to hear back from peer.
-				voteCh <- false
-			}(peer)
+			go rf.tryElection()
 		}
-
-		voteCnt := 1 // automatically vote from self
-		disVoteCnt := 0
-		for i := 1; i < len(rf.peers); i++ {
-			isGranted := <-voteCh
-			if isGranted {
-				voteCnt += 1
-			} else {
-				disVoteCnt += 1
-			}
-			if voteCnt >= (len(rf.peers)+1)/2 || disVoteCnt >= (len(rf.peers)+1)/2 {
-				break
-			}
-		}
-
-		if voteCnt >= (len(rf.peers)+1)/2 && rf.role == RaftRoleCandidate {
-			Debug(dVote, "S%d win an election with T%d", rf.me, rf.currentTerm)
-			// TODO (is this true?): It is impossible to have a candidate to win an election and
-			// receive a valid heart beat from a leader. In order to receive a majority vote,
-			// candidate's term must be higher than the majority, and the majority's term should
-			// be at least as high as the current leader.
-			// 1. If this candidate's term is larger than the leader, there can not be a valid heart bead.
-			// 2. If this candidate's term is smaller than the leader, it can not receive a majority vote.
-			rf.mu.Lock()
-			rf.role = RaftRoleLeader
-			request := &AppendEntriesArgs{
-				Term:     rf.currentTerm,
-				LeaderId: rf.me,
-			}
-			rf.mu.Unlock()
-			for {
-				heartBeatInterval := 100 * time.Millisecond
-				if rf.role != RaftRoleLeader {
-					Debug(dVote, "S%d no longer a leader", rf.me)
-					break
-				}
-				for idx, peer := range rf.peers {
-					if idx == rf.me {
-						continue
-					}
-					reply := &AppendEntriesReply{}
-					go func(e *labrpc.ClientEnd) {
-						// the leader will think it self as a leader.
-						if ok := e.Call(RaftRPCAppendENtries, request, reply); ok {
-							if reply.Term > rf.currentTerm {
-								rf.currentTerm = reply.Term
-								rf.votedFor = -1
-								rf.role = RaftRoleFollower
-							}
-						}
-
-					}(peer)
-				}
-				time.Sleep(heartBeatInterval)
-			}
-		} else {
-			Debug(dVote, "S%d does not receive enough votes or encounter a larger term number", rf.me)
-		}
-
-		// lose the election or no majority are live, un vote for self.
-		rf.mu.Lock()
-		// new term begin, clear vote
-		if thisTerm != rf.currentTerm {
-			rf.votedFor = -1
-		}
-		// if there is other heart beat get accepted by this server
-		rf.role = RaftRoleFollower
-		rf.mu.Unlock()
 	}
+}
+
+func (rf *Raft) tryElection() {
+	rf.mu.Lock()
+	rf.role = RaftRoleCandidate
+	rf.currentTerm += 1
+	rf.votedFor = rf.me
+	rf.lastHeartBeat = time.Now()
+	thisTerm := rf.currentTerm
+	rf.mu.Unlock()
+
+	Debug(dVote, "S%d start an election with T%d", rf.me, thisTerm)
+
+	request := &RequestVoteArgs{
+		Term:         thisTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: -1,
+		LastLogTerm:  -1,
+	}
+	voteCh := make(chan bool)
+	for idx, peer := range rf.peers {
+		if idx == rf.me {
+			continue
+		}
+		go func(e *labrpc.ClientEnd) {
+			defer func() { voteCh <- false }()
+			reply := &RequestVoteReply{}
+			if ok := e.Call(RaftRPCRequestVote, request, reply); ok {
+				voteCh <- reply.VoteGranted
+				if reply.Term > rf.currentTerm {
+					rf.currentTerm = reply.Term
+					rf.role = RaftRoleFollower
+					rf.votedFor = -1
+				}
+			}
+		}(peer)
+	}
+
+	// count vote
+	Debug(dVote, "S%d counting vote", rf.me)
+	voteCnt := 1
+	disVoteCnt := 0
+	for i := 1; i < len(rf.peers); i++ {
+		if <-voteCh {
+			voteCnt += 1
+		} else {
+			disVoteCnt += 1
+		}
+		if voteCnt >= (len(rf.peers)+1)/2 ||
+			disVoteCnt >= (len(rf.peers)+1)/2 {
+			break
+		}
+	}
+
+	// TODO (is this true?): It is impossible to have a candidate to win an election and
+	// receive a valid heart beat from a leader. In order to receive a majority vote,
+	// candidate's term must be higher than the majority, and the majority's term should
+	// be at least as high as the current leader.
+	// 1. If this candidate's term is larger than the leader, there can not be a valid heart bead.
+	// 2. If this candidate's term is smaller than the leader, it can not receive a majority vote.
+	if voteCnt >= (len(rf.peers)+1)/2 && rf.role == RaftRoleCandidate && thisTerm == rf.currentTerm {
+		Debug(dVote, "S%d win an election with T%d", rf.me, rf.currentTerm)
+		rf.mu.Lock()
+		rf.role = RaftRoleLeader
+		request := &AppendEntriesArgs{
+			Term:     rf.currentTerm,
+			LeaderId: rf.me,
+		}
+		rf.mu.Unlock()
+
+		// send heart beat to followers
+		for rf.role == RaftRoleLeader {
+			for idx, peer := range rf.peers {
+				if idx == rf.me {
+					continue
+				}
+				go func(e *labrpc.ClientEnd) {
+					reply := &AppendEntriesReply{}
+					if ok := e.Call(RaftRPCAppendENtries, request, reply); ok {
+						if reply.Term > rf.currentTerm {
+							rf.currentTerm = reply.Term
+							rf.votedFor = -1
+							rf.role = RaftRoleFollower
+						}
+					}
+				}(peer)
+			}
+			time.Sleep(heartBeatIntervalMS * time.Millisecond)
+		}
+	}
+
+	Debug(dVote, "S%d does not receive enough votes or encounter a larger term number", rf.me)
+	rf.mu.Lock()
+	rf.role = RaftRoleFollower
+	rf.mu.Unlock()
+
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -341,15 +356,16 @@ func (rf *Raft) ticker() {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
-	rf.role = RaftRoleFollower
-	rf.votedFor = -1
-	rf.lastHeartBeat = time.Now()
-	rf.currentTerm = 0
-
+	rf := &Raft{
+		peers:           peers,
+		persister:       persister,
+		me:              me,
+		role:            RaftRoleFollower,
+		votedFor:        -1,
+		lastHeartBeat:   time.Now(),
+		electionTrigger: make(chan bool),
+		currentTerm:     0,
+	}
 	// Your initialization code here (2A, 2B, 2C).
 
 	// timer for leader election
@@ -357,8 +373,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	// start ticker goroutine to start elections
-	go rf.ticker()
+	go rf.timeoutTicker(rf.electionTrigger)
+	go rf.runElection(rf.electionTrigger)
 
 	return rf
 }
