@@ -62,3 +62,17 @@ func Debug(topic logTopic, format string, a ...interface{}) {
 		log.Printf(format, a...)
 	}
 }
+
+func Max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func Min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
