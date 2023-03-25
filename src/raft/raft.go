@@ -95,17 +95,21 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	// update term
+	myTerm := rf.currentTerm
+	rf.currentTerm = Max(args.Term, rf.currentTerm)
 
 	reply.VoteGranted = false
-	Debug(dVote, "S%d receive vote request from S%d, currently vote for S%v(-1 means none)", rf.me, args.CandidateId, rf.votedFor)
-	if args.Term < rf.currentTerm { // reject vote
-		// Reply false if term < currentTerm
+	Debug(dVote, "S%d(T%d) receive vote request from S%d(T%d), currently vote for S%v(-1 means none)",
+		rf.me, myTerm, args.CandidateId, args.Term, rf.votedFor)
+	if args.Term < myTerm { // reject vote
+		// Reply false if term < myTerm
 		reply.VoteGranted = false
-		reply.Term = rf.currentTerm
+		reply.Term = myTerm
 		return
 	}
 
-	if (args.Term > rf.currentTerm || // immediately revert to follower which can grand vote
+	if (args.Term > myTerm || // immediately revert to follower which can grand vote
 		(rf.votedFor == args.CandidateId || rf.votedFor == -1)) &&
 		(args.LastLogTerm > rf.log[len(rf.log)-1].Term || // if candidate's log is more up to date
 			(args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex >= len(rf.log)-1)) {
@@ -113,7 +117,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// least as up-to-date as receiver’s log, grant vote.
 		// If the args.term is larger than current term, meaning this server can vote for another candidate.
 		// there are should be at most 1 vote for one term.
-		rf.currentTerm = args.Term
+		Debug(dTerm, "S%d meet T%d", rf.me, args.Term)
 		rf.role = RaftRoleFollower
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
@@ -123,12 +127,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		Debug(dVote, "S%d vote for S%d", rf.me, args.CandidateId)
 		rf.lastHeartBeat = time.Now()
 	}
+
 }
 
 // RequestVote is invoked by candidate to gather votes
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	if len(args.Entries) > 0 {
+		Debug(dLog, "S%d receive AppendEntries val: %v", rf.me, args)
+	}
+
+	if args.LeaderId == rf.votedFor {
+		rf.lastHeartBeat = time.Now()
+	}
+
 	// reject the request
 	if args.Term < rf.currentTerm || // invalid term
 		len(rf.log)-1 < args.PrevLogIdx || // follower does not have that many log entry as leader does
@@ -139,7 +152,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	reply.Success = true
-	if args.Term > rf.currentTerm {
+	if args.Term > rf.currentTerm || rf.role == RaftRoleCandidate {
 		// recognize this leader, give up the ongoing election on its term (if there is one).
 		rf.role = RaftRoleFollower
 		rf.currentTerm = args.Term
@@ -147,10 +160,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.votedFor = -1
 	}
 
-	if len(args.Entries) > 0 {
-		Debug(dLog, "S%d (log length %d) try to append entry asked by S%d, leaderCommitIdx %d, commitIdx %d\n",
-			rf.me, len(rf.log), args.LeaderId, args.LeaderCommitIdx, rf.commitIdx)
-	}
 	isMisMatch := false
 	for i, entry := range args.Entries {
 		nextIdx := args.PrevLogIdx + i + 1
@@ -170,18 +179,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 	if len(args.Entries) > 0 {
-		Debug(dLog, "S%d (log length %d) finished append entry\n", rf.me, len(rf.log))
+		Debug(dLog, "S%d appended log%d %v\n", rf.me, len(rf.log)-1, rf.log[len(rf.log)-1])
 	}
 
 	if args.LeaderCommitIdx > rf.commitIdx {
-		Debug(dLog, "S%d (log length %d) signal apply", rf.me, len(rf.log))
 		rf.commitIdx = Min(args.LeaderCommitIdx, len(rf.log)-1)
 		rf.applyCond.Signal()
 	}
 
-	if args.LeaderId == rf.votedFor {
-		rf.lastHeartBeat = time.Now()
-	}
 	reply.Term = rf.currentTerm
 }
 
@@ -204,30 +209,31 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, rf.currentTerm, false
 	}
 
+	Debug(dTrace, "S%d start with command %v", rf.me, command)
+
 	// only leader can call ApplyEntries to other server.
 	newLogEntry := LogEntry{Data: command, Term: rf.currentTerm}
 	rf.log = append(rf.log, newLogEntry)
 	curLogIdx := len(rf.log) - 1
 	rf.mu.Unlock()
 
-	request := &AppendEntriesArgs{
-		Term:            rf.currentTerm,
-		LeaderId:        rf.me,
-		PrevLogIdx:      curLogIdx - 1, // start with a dummy head
-		PrevLogTerm:     rf.log[curLogIdx-1].Term,
-		Entries:         []LogEntry{newLogEntry},
-		LeaderCommitIdx: rf.commitIdx,
-	}
 	successCh := make(chan bool)
-	Debug(dLog2, "S%d try to ask follower to append log entry, PrevLogIdx=%d, PrevLogTerm=%d", rf.me, request.PrevLogIdx, request.PrevLogTerm)
 	for idx, peer := range rf.peers {
 		if idx == rf.me {
 			continue
 		}
-		go func(e *labrpc.ClientEnd, successCh chan bool) {
+		go func(e *labrpc.ClientEnd, idx int, successCh chan bool) {
 			reply := &AppendEntriesReply{}
 			ok := false
 			for !ok {
+				request := &AppendEntriesArgs{
+					Term:            rf.currentTerm,
+					LeaderId:        rf.me,
+					PrevLogIdx:      rf.nextIdx[idx] - 1, // start with a dummy head
+					PrevLogTerm:     rf.log[rf.nextIdx[idx]-1].Term,
+					Entries:         rf.log[rf.nextIdx[idx]:],
+					LeaderCommitIdx: rf.commitIdx,
+				}
 				ok = e.Call(RaftRPCAppendENtries, request, reply)
 				if ok {
 					rf.mu.Lock()
@@ -235,15 +241,22 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 						rf.currentTerm = reply.Term
 						rf.role = RaftRoleFollower
 						rf.votedFor = -1
+						rf.mu.Unlock()
+						break
+					}
+					if reply.Success {
+						rf.matchIdx[idx]++
+						rf.nextIdx[idx] = curLogIdx + 1
 					} else {
-						// follower's log does not contain an entry at prevLogIndex
-						// whose term matches prevLogTerm.
+						Debug(dLog, "S%d received unmatched log%d for S%d, decrement nextIdx to %d",
+							rf.me, rf.nextIdx[idx], idx, rf.nextIdx[idx]-1)
+						rf.nextIdx[idx]--
 					}
 					rf.mu.Unlock()
-					successCh <- reply.Success
 				}
 			}
-		}(peer, successCh)
+			successCh <- reply.Success
+		}(peer, idx, successCh)
 	}
 
 	successCnt := 1 // self is consider a success
@@ -251,19 +264,25 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		if <-successCh {
 			successCnt++
 		}
-		if successCnt > (len(rf.peers)+1)/2 {
-			// commit point, can apply to the state machine
+		if successCnt > len(rf.peers)/2 {
+			// commit point, can apply to the state machine,
+			// need to make sure history log applied successfully.
 			rf.mu.Lock()
 			rf.commitIdx = Max(rf.commitIdx, curLogIdx)
-			applyMsg := ApplyMsg{
-				CommandValid: true,
-				Command:      command,
-				CommandIndex: curLogIdx,
+			for rf.lastApplied < rf.commitIdx {
+				rf.lastApplied++
+				applyMsg := ApplyMsg{
+					CommandValid: true,
+					Command:      command,
+					CommandIndex: rf.lastApplied,
+				}
+				Debug(dCommit, "S%d committing log%d %v",
+					rf.me, rf.lastApplied, rf.log[rf.lastApplied])
+				rf.mu.Unlock()
+				rf.applyCh <- applyMsg
+				rf.mu.Lock()
 			}
-			Debug(dLog2, "S%d log entry reach majority, apply log%d %v to state machine",
-				rf.me, curLogIdx, command)
 			rf.mu.Unlock()
-			rf.applyCh <- applyMsg
 			break
 		}
 	}
@@ -290,18 +309,17 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) applyMsg(cond *sync.Cond) {
+func (rf *Raft) commitLog(cond *sync.Cond) {
 	for !rf.killed() {
 		rf.mu.Lock()
 		for rf.commitIdx <= rf.lastApplied {
-			Debug(dLog2, "S%d applyMsg sleep", rf.me)
 			cond.Wait()
 		}
-		// applying message
+		// commit log
 		for rf.commitIdx > rf.lastApplied {
 			rf.mu.Unlock()
 			rf.lastApplied++
-			Debug(dLog2, "S%d begin apply log%d %v", rf.me, rf.lastApplied, rf.log[rf.lastApplied])
+			Debug(dCommit, "S%d committing log%d %v", rf.me, rf.lastApplied, rf.log[rf.lastApplied])
 			applyMsg := ApplyMsg{
 				CommandValid: true,
 				Command:      rf.log[rf.lastApplied].Data,
@@ -332,10 +350,10 @@ func (rf *Raft) timeoutTicker(trigger chan bool) {
 func (rf *Raft) runElection(trigger chan bool) {
 	for !rf.killed() {
 		if <-trigger {
+			Debug(dTimer, "S%d election timeout\n", rf.me)
 			if rf.role == RaftRoleLeader || rf.killed() {
 				continue
 			}
-			Debug(dVote, "S%d election timeout\n", rf.me)
 			go rf.tryElection()
 		}
 	}
@@ -351,7 +369,6 @@ func (rf *Raft) tryElection() {
 	rf.mu.Unlock()
 
 	Debug(dVote, "S%d start an election with T%d", rf.me, thisTerm)
-
 	request := &RequestVoteArgs{
 		Term:         thisTerm,
 		CandidateId:  rf.me,
@@ -370,6 +387,8 @@ func (rf *Raft) tryElection() {
 				voteCh <- reply.VoteGranted
 				rf.mu.Lock()
 				if reply.Term > rf.currentTerm {
+					Debug(dLeader, "S%d(T%d) meet T%d, revert to follower",
+						rf.me, rf.currentTerm, reply.Term)
 					rf.currentTerm = reply.Term
 					rf.role = RaftRoleFollower
 					rf.votedFor = -1
@@ -380,7 +399,6 @@ func (rf *Raft) tryElection() {
 	}
 
 	// count vote
-	Debug(dVote, "S%d counting vote", rf.me)
 	voteCnt := 1
 	disVoteCnt := 0
 	for i := 1; i < len(rf.peers); i++ {
@@ -389,8 +407,8 @@ func (rf *Raft) tryElection() {
 		} else {
 			disVoteCnt += 1
 		}
-		if voteCnt >= (len(rf.peers)+1)/2 ||
-			disVoteCnt >= (len(rf.peers)+1)/2 {
+		if voteCnt > len(rf.peers)/2 ||
+			disVoteCnt > len(rf.peers)/2 {
 			break
 		}
 	}
@@ -401,8 +419,8 @@ func (rf *Raft) tryElection() {
 	// be at least as high as the current leader.
 	// 1. If this candidate's term is larger than the leader, there can not be a valid heart bead.
 	// 2. If this candidate's term is smaller than the leader, it can not receive a majority vote.
-	if voteCnt >= (len(rf.peers)+1)/2 && rf.role == RaftRoleCandidate && thisTerm == rf.currentTerm {
-		Debug(dVote, "S%d win an election with T%d", rf.me, rf.currentTerm)
+	if voteCnt > len(rf.peers)/2 && rf.role == RaftRoleCandidate && thisTerm == rf.currentTerm {
+		Debug(dLeader, "S%d(T%d) is selected as leader", rf.me, rf.currentTerm)
 		rf.mu.Lock()
 		rf.role = RaftRoleLeader
 		// reinitialize leader state
@@ -437,6 +455,7 @@ func (rf *Raft) tryElection() {
 					if ok := e.Call(RaftRPCAppendENtries, request, reply); ok {
 						rf.mu.Lock()
 						if reply.Term > rf.currentTerm {
+							Debug(dTerm, "S%d meet T%d revert to follower", rf.me, reply.Term)
 							rf.currentTerm = reply.Term
 							rf.votedFor = -1
 							rf.role = RaftRoleFollower
@@ -447,9 +466,10 @@ func (rf *Raft) tryElection() {
 			}
 			time.Sleep(heartBeatIntervalMS * time.Millisecond)
 		}
+		Debug(dLeader, "S%d(T%d) is no longer a leader", rf.me, rf.currentTerm)
 	}
 
-	Debug(dVote, "S%d does not receive enough votes or encounter a larger term number", rf.me)
+	Debug(dVote, "S%d(T%d)'s election fail", rf.me, rf.currentTerm)
 	rf.mu.Lock()
 	rf.role = RaftRoleFollower
 	rf.mu.Unlock()
@@ -490,7 +510,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// run an election when timeout ticker goes off.
 	go rf.timeoutTicker(rf.electionTrigger)
 	go rf.runElection(rf.electionTrigger)
-	go rf.applyMsg(rf.applyCond)
+	go rf.commitLog(rf.applyCond)
 
 	return rf
 }
