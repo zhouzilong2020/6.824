@@ -41,8 +41,8 @@ type ApplyMsg struct {
 }
 
 type LogEntry struct {
-	data interface{}
-	term int
+	Data interface{}
+	Term int
 }
 
 // A Go object implementing a single Raft peer.
