@@ -98,13 +98,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	reply.VoteGranted = false
 	Debug(dVote, "S%d receive vote request from S%d, currently vote for S%v(-1 means none)", rf.me, args.CandidateId, rf.votedFor)
-	if args.Term < rf.currentTerm {
+	if args.Term < rf.currentTerm { // reject vote
 		// Reply false if term < currentTerm
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
-	} else if args.Term > rf.currentTerm ||
-		rf.votedFor == args.CandidateId ||
-		rf.votedFor == -1 {
+		return
+	}
+
+	if (args.Term > rf.currentTerm || // immediately revert to follower which can grand vote
+		(rf.votedFor == args.CandidateId || rf.votedFor == -1)) &&
+		(args.LastLogTerm > rf.log[len(rf.log)-1].Term || // if candidate's log is more up to date
+			(args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex >= len(rf.log)-1)) {
 		// If votedFor is null or candidateId, and candidate’s log is at
 		// least as up-to-date as receiver’s log, grant vote.
 		// If the args.term is larger than current term, meaning this server can vote for another candidate.
@@ -222,8 +226,8 @@ func (rf *Raft) tryElection() {
 	request := &RequestVoteArgs{
 		Term:         thisTerm,
 		CandidateId:  rf.me,
-		LastLogIndex: -1,
-		LastLogTerm:  -1,
+		LastLogIndex: len(rf.log) - 1,
+		LastLogTerm:  rf.log[len(rf.log)-1].Term,
 	}
 	voteCh := make(chan bool)
 	for idx, peer := range rf.peers {
@@ -272,6 +276,16 @@ func (rf *Raft) tryElection() {
 		Debug(dVote, "S%d win an election with T%d", rf.me, rf.currentTerm)
 		rf.mu.Lock()
 		rf.role = RaftRoleLeader
+		// reinitialize leader state
+		rf.nextIdx = make([]int, len(rf.peers))
+		rf.matchIdx = make([]int, len(rf.peers))
+		for idx := range rf.nextIdx {
+			// initialize to leader last log index +1
+			rf.nextIdx[idx] = len(rf.log)
+			// initialize to 0, increase monotonically
+			rf.matchIdx[idx] = 0
+		}
+
 		request := &AppendEntriesArgs{
 			Term:     rf.currentTerm,
 			LeaderId: rf.me,
@@ -329,7 +343,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		electionTrigger: make(chan bool),
 		applyCh:         applyCh,
 		currentTerm:     0,
-		log:             []LogEntry{{-1, -1} /*dummy head*/},
+		log:             []LogEntry{{-1, 0} /*dummy head*/},
 		commitIdx:       0,
 		lastApplied:     0,
 	}
