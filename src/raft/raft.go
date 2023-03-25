@@ -276,11 +276,13 @@ func (rf *Raft) tryElection() {
 			reply := &RequestVoteReply{}
 			if ok := e.Call(RaftRPCRequestVote, request, reply); ok {
 				voteCh <- reply.VoteGranted
+				rf.mu.Lock()
 				if reply.Term > rf.currentTerm {
 					rf.currentTerm = reply.Term
 					rf.role = RaftRoleFollower
 					rf.votedFor = -1
 				}
+				rf.mu.Unlock()
 			}
 		}(peer)
 	}
@@ -326,11 +328,13 @@ func (rf *Raft) tryElection() {
 				go func(e *labrpc.ClientEnd) {
 					reply := &AppendEntriesReply{}
 					if ok := e.Call(RaftRPCAppendENtries, request, reply); ok {
+						rf.mu.Lock()
 						if reply.Term > rf.currentTerm {
 							rf.currentTerm = reply.Term
 							rf.votedFor = -1
 							rf.role = RaftRoleFollower
 						}
+						rf.mu.Unlock()
 					}
 				}(peer)
 			}
