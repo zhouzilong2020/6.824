@@ -146,6 +146,39 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// a new term begin, clear vote
 		rf.votedFor = -1
 	}
+
+	if len(args.Entries) > 0 {
+		Debug(dLog, "S%d (log length %d) try to append entry asked by S%d, leaderCommitIdx %d, commitIdx %d\n",
+			rf.me, len(rf.log), args.LeaderId, args.LeaderCommitIdx, rf.commitIdx)
+	}
+	isMisMatch := false
+	for i, entry := range args.Entries {
+		nextIdx := args.PrevLogIdx + i + 1
+		// if there is not a mismatch, do not append
+		if !isMisMatch {
+			if len(rf.log)-1 < nextIdx {
+				isMisMatch = true
+			} else if rf.log[nextIdx].Term != entry.Term {
+				// delete this entry and everything follows it
+				rf.log = rf.log[:nextIdx-1]
+				isMisMatch = true
+			}
+		}
+
+		if isMisMatch { // mismatch happens, append everything from the args that not already in log.
+			rf.log = append(rf.log, entry)
+		}
+	}
+	if len(args.Entries) > 0 {
+		Debug(dLog, "S%d (log length %d) finished append entry\n", rf.me, len(rf.log))
+	}
+
+	if args.LeaderCommitIdx > rf.commitIdx {
+		Debug(dLog, "S%d (log length %d) signal apply", rf.me, len(rf.log))
+		rf.commitIdx = Min(args.LeaderCommitIdx, len(rf.log)-1)
+		rf.applyCond.Signal()
+	}
+
 	if args.LeaderId == rf.votedFor {
 		rf.lastHeartBeat = time.Now()
 	}
@@ -165,13 +198,77 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
+	if rf.role != RaftRoleLeader {
+		rf.mu.Unlock()
+		return -1, rf.currentTerm, false
+	}
 
-	// Your code here (2B).
+	// only leader can call ApplyEntries to other server.
+	newLogEntry := LogEntry{Data: command, Term: rf.currentTerm}
+	rf.log = append(rf.log, newLogEntry)
+	curLogIdx := len(rf.log) - 1
+	rf.mu.Unlock()
 
-	return index, term, isLeader
+	request := &AppendEntriesArgs{
+		Term:            rf.currentTerm,
+		LeaderId:        rf.me,
+		PrevLogIdx:      curLogIdx - 1, // start with a dummy head
+		PrevLogTerm:     rf.log[curLogIdx-1].Term,
+		Entries:         []LogEntry{newLogEntry},
+		LeaderCommitIdx: rf.commitIdx,
+	}
+	successCh := make(chan bool)
+	Debug(dLog2, "S%d try to ask follower to append log entry, PrevLogIdx=%d, PrevLogTerm=%d", rf.me, request.PrevLogIdx, request.PrevLogTerm)
+	for idx, peer := range rf.peers {
+		if idx == rf.me {
+			continue
+		}
+		go func(e *labrpc.ClientEnd, successCh chan bool) {
+			reply := &AppendEntriesReply{}
+			ok := false
+			for !ok {
+				ok = e.Call(RaftRPCAppendENtries, request, reply)
+				if ok {
+					rf.mu.Lock()
+					if reply.Term > rf.currentTerm {
+						rf.currentTerm = reply.Term
+						rf.role = RaftRoleFollower
+						rf.votedFor = -1
+					} else {
+						// follower's log does not contain an entry at prevLogIndex
+						// whose term matches prevLogTerm.
+					}
+					rf.mu.Unlock()
+					successCh <- reply.Success
+				}
+			}
+		}(peer, successCh)
+	}
+
+	successCnt := 1 // self is consider a success
+	for i := 1; i < len(rf.peers); i++ {
+		if <-successCh {
+			successCnt++
+		}
+		if successCnt > (len(rf.peers)+1)/2 {
+			// commit point, can apply to the state machine
+			rf.mu.Lock()
+			rf.commitIdx = Max(rf.commitIdx, curLogIdx)
+			applyMsg := ApplyMsg{
+				CommandValid: true,
+				Command:      command,
+				CommandIndex: curLogIdx,
+			}
+			Debug(dLog2, "S%d log entry reach majority, apply log%d %v to state machine",
+				rf.me, curLogIdx, command)
+			rf.mu.Unlock()
+			rf.applyCh <- applyMsg
+			break
+		}
+	}
+
+	return curLogIdx, rf.currentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -193,6 +290,31 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) applyMsg(cond *sync.Cond) {
+	for !rf.killed() {
+		rf.mu.Lock()
+		for rf.commitIdx <= rf.lastApplied {
+			Debug(dLog2, "S%d applyMsg sleep", rf.me)
+			cond.Wait()
+		}
+		// applying message
+		for rf.commitIdx > rf.lastApplied {
+			rf.mu.Unlock()
+			rf.lastApplied++
+			Debug(dLog2, "S%d begin apply log%d %v", rf.me, rf.lastApplied, rf.log[rf.lastApplied])
+			applyMsg := ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[rf.lastApplied].Data,
+				CommandIndex: rf.lastApplied,
+			}
+			rf.applyCh <- applyMsg
+			rf.mu.Lock()
+		}
+
+		rf.mu.Unlock()
+	}
+}
+
 // timeoutTicker will trigger a election every timeoutMS.
 func (rf *Raft) timeoutTicker(trigger chan bool) {
 	for !rf.killed() {
@@ -210,10 +332,10 @@ func (rf *Raft) timeoutTicker(trigger chan bool) {
 func (rf *Raft) runElection(trigger chan bool) {
 	for !rf.killed() {
 		if <-trigger {
-			Debug(dVote, "S%d election timeout\n", rf.me)
 			if rf.role == RaftRoleLeader || rf.killed() {
 				continue
 			}
+			Debug(dVote, "S%d election timeout\n", rf.me)
 			go rf.tryElection()
 		}
 	}
@@ -292,15 +414,20 @@ func (rf *Raft) tryElection() {
 			// initialize to 0, increase monotonically
 			rf.matchIdx[idx] = 0
 		}
-
-		request := &AppendEntriesArgs{
-			Term:     rf.currentTerm,
-			LeaderId: rf.me,
-		}
 		rf.mu.Unlock()
 
 		// send heart beat to followers
 		for rf.role == RaftRoleLeader {
+			rf.mu.Lock()
+			request := &AppendEntriesArgs{
+				Term:            rf.currentTerm,
+				LeaderId:        rf.me,
+				PrevLogIdx:      len(rf.log) - 1, // start with a dummy head
+				PrevLogTerm:     rf.log[len(rf.log)-1].Term,
+				LeaderCommitIdx: rf.commitIdx,
+			}
+			rf.mu.Unlock()
+
 			for idx, peer := range rf.peers {
 				if idx == rf.me {
 					continue
@@ -326,7 +453,6 @@ func (rf *Raft) tryElection() {
 	rf.mu.Lock()
 	rf.role = RaftRoleFollower
 	rf.mu.Unlock()
-
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -364,6 +490,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// run an election when timeout ticker goes off.
 	go rf.timeoutTicker(rf.electionTrigger)
 	go rf.runElection(rf.electionTrigger)
+	go rf.applyMsg(rf.applyCond)
 
 	return rf
 }
