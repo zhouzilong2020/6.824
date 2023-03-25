@@ -28,47 +28,6 @@ import (
 	"6.5840/labrpc"
 )
 
-// as each Raft peer becomes aware that successive log entries are
-// committed, the peer should send an ApplyMsg to the service (or
-// tester) on the same server, via the applyCh passed to Make(). set
-// CommandValid to true to indicate that the ApplyMsg contains a newly
-// committed log entry.
-//
-// in part 2D you'll want to send other kinds of messages (e.g.,
-// snapshots) on the applyCh, but set CommandValid to false for these
-// other uses.
-type ApplyMsg struct {
-	CommandValid bool
-	Command      interface{}
-	CommandIndex int
-
-	// For 2D:
-	SnapshotValid bool
-	Snapshot      []byte
-	SnapshotTerm  int
-	SnapshotIndex int
-}
-
-// A Go object implementing a single Raft peer.
-type Raft struct {
-	mu              sync.Mutex          // Lock to protect shared access to this peer's state
-	peers           []*labrpc.ClientEnd // RPC end points of all peers
-	persister       *Persister          // Object to hold this peer's persisted state
-	me              int                 // this peer's index into peers[]
-	dead            int32               // set by Kill()
-	role            RaftRole
-	lastHeartBeat   time.Time
-	electionTrigger chan bool
-
-	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
-
-	// for leader election
-	currentTerm int
-	votedFor    int
-}
-
 const (
 	heartBeatIntervalMS  = 100
 	electionTimeoutMinMS = 300
@@ -139,13 +98,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	reply.VoteGranted = false
 	Debug(dVote, "S%d receive vote request from S%d, currently vote for S%v(-1 means none)", rf.me, args.CandidateId, rf.votedFor)
-	if args.Term < rf.currentTerm {
+	if args.Term < rf.currentTerm { // reject vote
 		// Reply false if term < currentTerm
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
-	} else if args.Term > rf.currentTerm ||
-		rf.votedFor == args.CandidateId ||
-		rf.votedFor == -1 {
+		return
+	}
+
+	if (args.Term > rf.currentTerm || // immediately revert to follower which can grand vote
+		(rf.votedFor == args.CandidateId || rf.votedFor == -1)) &&
+		(args.LastLogTerm > rf.log[len(rf.log)-1].Term || // if candidate's log is more up to date
+			(args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex >= len(rf.log)-1)) {
 		// If votedFor is null or candidateId, and candidate’s log is at
 		// least as up-to-date as receiver’s log, grant vote.
 		// If the args.term is larger than current term, meaning this server can vote for another candidate.
@@ -166,17 +129,24 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	// reject the request
+	if args.Term < rf.currentTerm || // invalid term
+		len(rf.log)-1 < args.PrevLogIdx || // follower does not have that many log entry as leader does
+		rf.log[args.PrevLogIdx].Term != args.PrevLogTerm { // invalid entry
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		return
+	}
 
 	reply.Success = true
-	if args.Term < rf.currentTerm {
-		reply.Success = false
-	} else if args.Term > rf.currentTerm {
-		// recognize this leader, give up any ongoing election or its term
+	if args.Term > rf.currentTerm {
+		// recognize this leader, give up the ongoing election on its term (if there is one).
 		rf.role = RaftRoleFollower
-		// a new term begin, clear vote
 		rf.currentTerm = args.Term
+		// a new term begin, clear vote
 		rf.votedFor = -1
-	} else if args.LeaderId == rf.votedFor {
+	}
+	if args.LeaderId == rf.votedFor {
 		rf.lastHeartBeat = time.Now()
 	}
 	reply.Term = rf.currentTerm
@@ -263,8 +233,8 @@ func (rf *Raft) tryElection() {
 	request := &RequestVoteArgs{
 		Term:         thisTerm,
 		CandidateId:  rf.me,
-		LastLogIndex: -1,
-		LastLogTerm:  -1,
+		LastLogIndex: len(rf.log) - 1,
+		LastLogTerm:  rf.log[len(rf.log)-1].Term,
 	}
 	voteCh := make(chan bool)
 	for idx, peer := range rf.peers {
@@ -276,11 +246,13 @@ func (rf *Raft) tryElection() {
 			reply := &RequestVoteReply{}
 			if ok := e.Call(RaftRPCRequestVote, request, reply); ok {
 				voteCh <- reply.VoteGranted
+				rf.mu.Lock()
 				if reply.Term > rf.currentTerm {
 					rf.currentTerm = reply.Term
 					rf.role = RaftRoleFollower
 					rf.votedFor = -1
 				}
+				rf.mu.Unlock()
 			}
 		}(peer)
 	}
@@ -311,6 +283,16 @@ func (rf *Raft) tryElection() {
 		Debug(dVote, "S%d win an election with T%d", rf.me, rf.currentTerm)
 		rf.mu.Lock()
 		rf.role = RaftRoleLeader
+		// reinitialize leader state
+		rf.nextIdx = make([]int, len(rf.peers))
+		rf.matchIdx = make([]int, len(rf.peers))
+		for idx := range rf.nextIdx {
+			// initialize to leader last log index +1
+			rf.nextIdx[idx] = len(rf.log)
+			// initialize to 0, increase monotonically
+			rf.matchIdx[idx] = 0
+		}
+
 		request := &AppendEntriesArgs{
 			Term:     rf.currentTerm,
 			LeaderId: rf.me,
@@ -326,11 +308,13 @@ func (rf *Raft) tryElection() {
 				go func(e *labrpc.ClientEnd) {
 					reply := &AppendEntriesReply{}
 					if ok := e.Call(RaftRPCAppendENtries, request, reply); ok {
+						rf.mu.Lock()
 						if reply.Term > rf.currentTerm {
 							rf.currentTerm = reply.Term
 							rf.votedFor = -1
 							rf.role = RaftRoleFollower
 						}
+						rf.mu.Unlock()
 					}
 				}(peer)
 			}
@@ -364,15 +348,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		votedFor:        -1,
 		lastHeartBeat:   time.Now(),
 		electionTrigger: make(chan bool),
+		applyCh:         applyCh,
 		currentTerm:     0,
+		log:             []LogEntry{{-1, 0} /*dummy head*/},
+		commitIdx:       0,
+		lastApplied:     0,
 	}
+	rf.applyCond = sync.NewCond(&rf.mu)
+
 	// Your initialization code here (2A, 2B, 2C).
 
-	// timer for leader election
-
-	// initialize from state persisted before a crash
+	// initialize from state persisted before a crash.
 	rf.readPersist(persister.ReadRaftState())
 
+	// run an election when timeout ticker goes off.
 	go rf.timeoutTicker(rf.electionTrigger)
 	go rf.runElection(rf.electionTrigger)
 
