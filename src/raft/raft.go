@@ -129,17 +129,24 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	// reject the request
+	if args.Term < rf.currentTerm || // invalid term
+		len(rf.log)-1 < args.PrevLogIdx || // follower does not have that many log entry as leader does
+		rf.log[args.PrevLogIdx].Term != args.PrevLogTerm { // invalid entry
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		return
+	}
 
 	reply.Success = true
-	if args.Term < rf.currentTerm {
-		reply.Success = false
-	} else if args.Term > rf.currentTerm {
-		// recognize this leader, give up any ongoing election or its term
+	if args.Term > rf.currentTerm {
+		// recognize this leader, give up the ongoing election on its term (if there is one).
 		rf.role = RaftRoleFollower
-		// a new term begin, clear vote
 		rf.currentTerm = args.Term
+		// a new term begin, clear vote
 		rf.votedFor = -1
-	} else if args.LeaderId == rf.votedFor {
+	}
+	if args.LeaderId == rf.votedFor {
 		rf.lastHeartBeat = time.Now()
 	}
 	reply.Term = rf.currentTerm
