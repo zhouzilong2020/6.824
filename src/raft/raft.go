@@ -244,11 +244,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				ok = e.Call(RaftRPCAppendENtries, request, reply)
 				if ok {
 					rf.mu.Lock()
-					rf.currentTerm = Max(reply.Term, rf.currentTerm)
-					if reply.Term > myTerm {
-						rf.role = RaftRoleFollower
-						rf.votedFor = -1
-					}
+					rf.checkTerm(reply.Term, idx)
 					if reply.Term == myTerm {
 						if reply.Success {
 							rf.matchIdx[idx]++
@@ -302,6 +298,19 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 }
 
+// checkTerm will check the term and current term with lock held.
+func (rf *Raft) checkTerm(term int, serverIdx int) bool {
+	if term > rf.currentTerm {
+		Debug(dTerm, "S%d(%d) meet S%d(T%d) revert to follower",
+			rf.me, rf.currentTerm, serverIdx, term)
+		rf.currentTerm = term
+		rf.votedFor = -1
+		rf.role = RaftRoleFollower
+		return true
+	}
+	return false
+}
+
 func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
@@ -337,8 +346,15 @@ func (rf *Raft) timeoutTicker(trigger chan bool) {
 		timeoutMS := rand.Int63n(electionTimeoutMaxMS-electionTimeoutMinMS) + electionTimeoutMinMS
 		timeoutMSDuration := time.Duration(timeoutMS) * time.Millisecond
 		time.Sleep(timeoutMSDuration)
-		if time.Since(rf.lastHeartBeat) > timeoutMSDuration &&
-			rf.role != RaftRoleLeader {
+
+		rf.mu.Lock()
+		lastHeartBeat := rf.lastHeartBeat
+		role := rf.role
+		rf.mu.Unlock()
+
+		if time.Since(lastHeartBeat) > timeoutMSDuration &&
+			role != RaftRoleLeader {
+			Debug(dTimer, "S%d election timeout, last heartbeat %v, elapse %v, timeout interval %v", rf.me, lastHeartBeat, time.Since(lastHeartBeat), timeoutMSDuration)
 			trigger <- true
 		}
 	}
@@ -348,13 +364,63 @@ func (rf *Raft) timeoutTicker(trigger chan bool) {
 func (rf *Raft) runElection(trigger chan bool) {
 	for !rf.killed() {
 		if <-trigger {
-			Debug(dTimer, "S%d election timeout\n", rf.me)
 			if rf.role == RaftRoleLeader || rf.killed() {
 				continue
 			}
 			go rf.tryElection()
 		}
 	}
+}
+
+func (rf *Raft) heartbeat(myTerm int) {
+	for rf.role == RaftRoleLeader {
+		commitIdx := rf.commitIdx
+		for idx, peer := range rf.peers {
+			if idx == rf.me {
+				continue
+			}
+			rf.mu.Lock()
+			request := &AppendEntriesArgs{
+				Term:            myTerm,
+				LeaderId:        rf.me,
+				PrevLogIdx:      rf.nextIdx[idx] - 1, // start with a dummy head
+				PrevLogTerm:     rf.log[rf.nextIdx[idx]-1].Term,
+				Entries:         rf.log[rf.nextIdx[idx]:],
+				LeaderCommitIdx: commitIdx,
+			}
+			rf.mu.Unlock()
+			go func(e *labrpc.ClientEnd, idx int) {
+				reply := &AppendEntriesReply{}
+				if ok := e.Call(RaftRPCAppendENtries, request, reply); ok {
+					rf.mu.Lock()
+					rf.checkTerm(reply.Term, idx)
+					rf.mu.Unlock()
+				}
+			}(peer, idx)
+		}
+
+		// last bulletin point in fig.2
+		rf.mu.Lock()
+		oldCommitIdx := rf.commitIdx
+		for i := oldCommitIdx + 1; i < len(rf.log); i++ {
+			matchCnt := 1
+			for _, followerMatchIdx := range rf.matchIdx {
+				if followerMatchIdx >= i {
+					matchCnt++
+				}
+			}
+			if matchCnt > len(rf.peers)/2 && rf.log[i].Term == rf.currentTerm {
+				rf.commitIdx = i
+			}
+		}
+		rf.mu.Unlock()
+		if oldCommitIdx != rf.commitIdx {
+			rf.commitCond.Signal()
+		}
+
+		time.Sleep(heartBeatIntervalMS * time.Millisecond)
+	}
+	Debug(dLeader, "S%d(T%d) is no longer a leader, stop sending heartbeat", rf.me, rf.currentTerm)
 }
 
 func (rf *Raft) tryElection() {
@@ -374,7 +440,6 @@ func (rf *Raft) tryElection() {
 		LastLogTerm:  rf.log[len(rf.log)-1].Term,
 	}
 	voteCh := make(chan bool)
-	isReverted := false
 	for idx, peer := range rf.peers {
 		if idx == rf.me {
 			continue
@@ -385,14 +450,7 @@ func (rf *Raft) tryElection() {
 			if ok := e.Call(RaftRPCRequestVote, request, reply); ok {
 				voteCh <- reply.VoteGranted
 				rf.mu.Lock()
-				rf.currentTerm = Max(reply.Term, rf.currentTerm)
-				if reply.Term > myTerm && !isReverted {
-					Debug(dLeader, "S%d(T%d) meet S%d(T%d), revert to follower",
-						rf.me, myTerm, idx, reply.Term)
-					rf.role = RaftRoleFollower
-					rf.votedFor = -1
-					isReverted = true
-				}
+				rf.checkTerm(reply.Term, idx)
 				rf.mu.Unlock()
 			}
 		}(peer, idx)
@@ -433,48 +491,14 @@ func (rf *Raft) tryElection() {
 			rf.matchIdx[idx] = 0
 		}
 		rf.mu.Unlock()
-
-		// send heart beat to followers
-		for rf.role == RaftRoleLeader {
-			commitIdx := rf.commitIdx
-			for idx, peer := range rf.peers {
-				if idx == rf.me {
-					continue
-				}
-				rf.mu.Lock()
-				// TODO: here is replica in the START
-				request := &AppendEntriesArgs{
-					Term:            myTerm,
-					LeaderId:        rf.me,
-					PrevLogIdx:      rf.nextIdx[idx] - 1, // start with a dummy head
-					PrevLogTerm:     rf.log[rf.nextIdx[idx]-1].Term,
-					Entries:         rf.log[rf.nextIdx[idx]:],
-					LeaderCommitIdx: commitIdx,
-				}
-				rf.mu.Unlock()
-				go func(e *labrpc.ClientEnd, idx int) {
-					reply := &AppendEntriesReply{}
-					if ok := e.Call(RaftRPCAppendENtries, request, reply); ok {
-						rf.mu.Lock()
-						if reply.Term > myTerm {
-							Debug(dTerm, "S%d(%d) meet S%d(T%d) revert to follower",
-								rf.me, myTerm, idx, reply.Term)
-							rf.currentTerm = reply.Term
-							rf.votedFor = -1
-							rf.role = RaftRoleFollower
-						}
-						rf.mu.Unlock()
-					}
-				}(peer, idx)
-			}
-			time.Sleep(heartBeatIntervalMS * time.Millisecond)
-		}
-		Debug(dLeader, "S%d(T%d) is no longer a leader", rf.me, rf.currentTerm)
+		// start heart beat, stop when server is no longer a leader.
+		go rf.heartbeat(myTerm)
+	} else {
+		// lose election, revert to follower
+		rf.mu.Lock()
+		rf.role = RaftRoleFollower
+		rf.mu.Unlock()
 	}
-
-	rf.mu.Lock()
-	rf.role = RaftRoleFollower
-	rf.mu.Unlock()
 }
 
 // the service or tester wants to create a Raft server. the ports
