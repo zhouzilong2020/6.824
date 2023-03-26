@@ -97,7 +97,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	// update term
 	myTerm := rf.currentTerm
+	reply.Term = myTerm
 	rf.currentTerm = Max(args.Term, rf.currentTerm)
+	if myTerm < rf.currentTerm {
+		// demoted to follower
+		rf.role = RaftRoleFollower
+		rf.votedFor = -1
+	}
 
 	reply.VoteGranted = false
 	Debug(dVote, "S%d(T%d) receive vote request from S%d(T%d), currently vote for S%v(-1 means none)",
@@ -105,7 +111,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < myTerm { // reject vote
 		// Reply false if term < myTerm
 		reply.VoteGranted = false
-		reply.Term = myTerm
 		return
 	}
 
@@ -134,8 +139,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if len(args.Entries) > 0 {
-		Debug(dLog, "S%d receive AppendEntries val: %v", rf.me, args)
+	myTerm := rf.currentTerm
+	rf.currentTerm = Max(rf.currentTerm, args.Term)
+	if myTerm != rf.currentTerm {
+		rf.votedFor = -1
 	}
 
 	if args.LeaderId == rf.votedFor {
@@ -143,19 +150,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// reject the request
-	if args.Term < rf.currentTerm || // invalid term
+	if args.Term < myTerm || // invalid term
 		len(rf.log)-1 < args.PrevLogIdx || // follower does not have that many log entry as leader does
 		rf.log[args.PrevLogIdx].Term != args.PrevLogTerm { // invalid entry
 		reply.Success = false
-		reply.Term = rf.currentTerm
 		return
 	}
 
+	if len(args.Entries) > 0 {
+		Debug(dLog, "S%d receive AppendEntries val: %v", rf.me, args)
+	}
+
 	reply.Success = true
-	if args.Term > rf.currentTerm || rf.role == RaftRoleCandidate {
+	if args.Term > myTerm || rf.role == RaftRoleCandidate {
 		// recognize this leader, give up the ongoing election on its term (if there is one).
 		rf.role = RaftRoleFollower
-		rf.currentTerm = args.Term
 		// a new term begin, clear vote
 		rf.votedFor = -1
 	}
@@ -169,17 +178,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				isMisMatch = true
 			} else if rf.log[nextIdx].Term != entry.Term {
 				// delete this entry and everything follows it
-				rf.log = rf.log[:nextIdx-1]
+				rf.log = rf.log[:nextIdx]
 				isMisMatch = true
 			}
 		}
 
 		if isMisMatch { // mismatch happens, append everything from the args that not already in log.
 			rf.log = append(rf.log, entry)
+			Debug(dLog, "S%d appended log%d %v\n", rf.me, len(rf.log)-1, rf.log[len(rf.log)-1])
 		}
-	}
-	if len(args.Entries) > 0 {
-		Debug(dLog, "S%d appended log%d %v\n", rf.me, len(rf.log)-1, rf.log[len(rf.log)-1])
 	}
 
 	if args.LeaderCommitIdx > rf.commitIdx {
@@ -187,7 +194,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.applyCond.Signal()
 	}
 
-	reply.Term = rf.currentTerm
+	reply.Term = myTerm
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -209,12 +216,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, rf.currentTerm, false
 	}
 
-	Debug(dTrace, "S%d start with command %v", rf.me, command)
+	Debug(dTrace, "S%d(T%d) start with command %v", rf.me, rf.currentTerm, command)
 
 	// only leader can call ApplyEntries to other server.
 	newLogEntry := LogEntry{Data: command, Term: rf.currentTerm}
 	rf.log = append(rf.log, newLogEntry)
 	curLogIdx := len(rf.log) - 1
+	myTerm := rf.currentTerm
 	rf.mu.Unlock()
 
 	successCh := make(chan bool)
@@ -225,15 +233,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		go func(e *labrpc.ClientEnd, idx int, successCh chan bool) {
 			reply := &AppendEntriesReply{}
 			ok := false
-			for !ok {
+			for !ok && rf.role == RaftRoleLeader {
 				request := &AppendEntriesArgs{
-					Term:            rf.currentTerm,
+					Term:            myTerm,
 					LeaderId:        rf.me,
 					PrevLogIdx:      rf.nextIdx[idx] - 1, // start with a dummy head
 					PrevLogTerm:     rf.log[rf.nextIdx[idx]-1].Term,
 					Entries:         rf.log[rf.nextIdx[idx]:],
 					LeaderCommitIdx: rf.commitIdx,
 				}
+
 				ok = e.Call(RaftRPCAppendENtries, request, reply)
 				if ok {
 					rf.mu.Lock()
@@ -248,8 +257,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 						rf.matchIdx[idx]++
 						rf.nextIdx[idx] = curLogIdx + 1
 					} else {
-						Debug(dLog, "S%d received unmatched log%d for S%d, decrement nextIdx to %d",
-							rf.me, rf.nextIdx[idx], idx, rf.nextIdx[idx]-1)
 						rf.nextIdx[idx]--
 					}
 					rf.mu.Unlock()
@@ -258,34 +265,23 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			successCh <- reply.Success
 		}(peer, idx, successCh)
 	}
-
-	successCnt := 1 // self is consider a success
-	for i := 1; i < len(rf.peers); i++ {
-		if <-successCh {
-			successCnt++
-		}
-		if successCnt > len(rf.peers)/2 {
-			// commit point, can apply to the state machine,
-			// need to make sure history log applied successfully.
-			rf.mu.Lock()
-			rf.commitIdx = Max(rf.commitIdx, curLogIdx)
-			for rf.lastApplied < rf.commitIdx {
-				rf.lastApplied++
-				applyMsg := ApplyMsg{
-					CommandValid: true,
-					Command:      command,
-					CommandIndex: rf.lastApplied,
-				}
-				Debug(dCommit, "S%d committing log%d %v",
-					rf.me, rf.lastApplied, rf.log[rf.lastApplied])
-				rf.mu.Unlock()
-				rf.applyCh <- applyMsg
-				rf.mu.Lock()
+	go func(successCh chan bool) {
+		successCnt := 1 // self is consider a success
+		for i := 1; i < len(rf.peers); i++ {
+			if <-successCh {
+				successCnt++
 			}
-			rf.mu.Unlock()
-			break
+			if successCnt > len(rf.peers)/2 {
+				// commit point, can apply to the state machine,
+				// need to make sure history log applied successfully.
+				rf.mu.Lock()
+				rf.commitIdx = Max(rf.commitIdx, curLogIdx)
+				rf.mu.Unlock()
+				rf.applyCond.Signal()
+				break
+			}
 		}
-	}
+	}(successCh)
 
 	return curLogIdx, rf.currentTerm, true
 }
@@ -427,7 +423,7 @@ func (rf *Raft) tryElection() {
 		rf.nextIdx = make([]int, len(rf.peers))
 		rf.matchIdx = make([]int, len(rf.peers))
 		for idx := range rf.nextIdx {
-			// initialize to leader last log index +1
+			// initialize to leader last log index+1
 			rf.nextIdx[idx] = len(rf.log)
 			// initialize to 0, increase monotonically
 			rf.matchIdx[idx] = 0
@@ -469,7 +465,6 @@ func (rf *Raft) tryElection() {
 		Debug(dLeader, "S%d(T%d) is no longer a leader", rf.me, rf.currentTerm)
 	}
 
-	Debug(dVote, "S%d(T%d)'s election fail", rf.me, rf.currentTerm)
 	rf.mu.Lock()
 	rf.role = RaftRoleFollower
 	rf.mu.Unlock()
