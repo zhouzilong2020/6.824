@@ -8,6 +8,12 @@ import (
 	"6.5840/labrpc"
 )
 
+const (
+	heartBeatIntervalMS  = 100
+	electionTimeoutMinMS = 400
+	electionTimeoutMaxMS = 800
+)
+
 type RaftRole string
 
 const (
@@ -95,7 +101,7 @@ type AppendEntriesArgs struct {
 }
 
 func (args AppendEntriesArgs) String() string {
-	return fmt.Sprintf("T%d, leader%d, prevLogIdx%d, PrevLogTerm%d", args.Term, args.LeaderId, args.PrevLogIdx, args.PrevLogTerm)
+	return fmt.Sprintf("S%d(T%d), prev_log%d(T%d), commit %d", args.LeaderId, args.Term, args.PrevLogIdx, args.PrevLogTerm, args.LeaderCommitIdx)
 }
 
 type AppendEntriesReply struct {

@@ -28,12 +28,6 @@ import (
 	"6.5840/labrpc"
 )
 
-const (
-	heartBeatIntervalMS  = 100
-	electionTimeoutMinMS = 300
-	electionTimeoutMaxMS = 600
-)
-
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
