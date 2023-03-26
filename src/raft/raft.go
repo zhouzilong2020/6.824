@@ -134,38 +134,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	myTerm := rf.currentTerm
-	rf.currentTerm = Max(rf.currentTerm, args.Term)
-	if myTerm != rf.currentTerm {
-		rf.votedFor = -1
-	}
 	reply.Term = myTerm
-
-	if args.LeaderId == rf.votedFor {
-		rf.lastHeartBeat = time.Now()
-	}
-
-	if len(args.Entries) > 0 {
-		Debug(dLog, "S%d(T%d) receive AppendEntries val: %v", rf.me, myTerm, args)
-	} else {
-		Debug(dLog, "S%d(T%d) receive heart beat from S%d(T%d)", rf.me, myTerm, args.LeaderId, args.Term)
-	}
+	rf.checkTerm(args.Term, args.LeaderId)
+	// either initiate by  heartbeat() of Start().
+	Debug(dLog, "S%d(T%d) receive AppendEntries val: %v", rf.me, myTerm, args)
 	// reject the request
 	if args.Term < myTerm || // invalid term
 		len(rf.log)-1 < args.PrevLogIdx || // follower does not have that many log entry as leader does
 		rf.log[args.PrevLogIdx].Term != args.PrevLogTerm { // invalid entry
-		// if len(args.Entries) > 0 {
 		Debug(dLog, "S%d(T%d) rejected S%d, lastIdx %d", rf.me, myTerm, args.LeaderId, len(rf.log)-1)
-		// }
 		reply.Success = false
 		return
 	}
 
+	rf.lastHeartBeat = time.Now()
+	Debug(dTimer, "S%d(T%d) update heartbeat %v", rf.me, myTerm, rf.lastHeartBeat)
 	reply.Success = true
-	if args.Term > myTerm || rf.role == RaftRoleCandidate {
+	if rf.role == RaftRoleCandidate {
 		// recognize this leader, give up the ongoing election on its term (if there is one).
 		rf.role = RaftRoleFollower
-		// a new term begin, clear vote
-		rf.votedFor = -1
 	}
 
 	isMisMatch := false
