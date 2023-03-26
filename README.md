@@ -15,7 +15,7 @@ Summary: 4 labs for practice.
 
 ### Status
 - [X] lab1: Map Reduce with fail recovery
-- [ ] lab2A
+- [X] lab2A: Raft election
 - [ ] lab2B
 - [ ] lab2C
 - [ ] lab2D
