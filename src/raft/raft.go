@@ -106,7 +106,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	reply.VoteGranted = false
-	Debug(dVote, "S%d(T%d) receive vote request from S%d(T%d), currently vote for S%v(-1 means none)",
+	Debug(dVote, "S%d(T%d) receive vote request from S%d(T%d), voted for S%v",
 		rf.me, myTerm, args.CandidateId, args.Term, rf.votedFor)
 	if args.Term < myTerm { // reject vote
 		// Reply false if term < myTerm
@@ -144,21 +144,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if myTerm != rf.currentTerm {
 		rf.votedFor = -1
 	}
+	reply.Term = myTerm
 
 	if args.LeaderId == rf.votedFor {
 		rf.lastHeartBeat = time.Now()
+	}
+
+	if len(args.Entries) > 0 {
+		Debug(dLog, "S%d(T%d) receive AppendEntries val: %v", rf.me, myTerm, args)
 	}
 
 	// reject the request
 	if args.Term < myTerm || // invalid term
 		len(rf.log)-1 < args.PrevLogIdx || // follower does not have that many log entry as leader does
 		rf.log[args.PrevLogIdx].Term != args.PrevLogTerm { // invalid entry
+		if len(args.Entries) > 0 {
+			Debug(dLog, "S%d(T%d) rejected S%d, lastIdx %d", rf.me, myTerm, args.LeaderId, len(rf.log)-1)
+		}
 		reply.Success = false
 		return
-	}
-
-	if len(args.Entries) > 0 {
-		Debug(dLog, "S%d receive AppendEntries val: %v", rf.me, args)
 	}
 
 	reply.Success = true
@@ -194,7 +198,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.applyCond.Signal()
 	}
 
-	reply.Term = myTerm
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -216,8 +219,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, rf.currentTerm, false
 	}
 
-	Debug(dTrace, "S%d(T%d) start with command %v", rf.me, rf.currentTerm, command)
-
 	// only leader can call ApplyEntries to other server.
 	newLogEntry := LogEntry{Data: command, Term: rf.currentTerm}
 	rf.log = append(rf.log, newLogEntry)
@@ -233,7 +234,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		go func(e *labrpc.ClientEnd, idx int, successCh chan bool) {
 			reply := &AppendEntriesReply{}
 			ok := false
-			for !ok && rf.role == RaftRoleLeader {
+			for (!ok || !reply.Success) && rf.role == RaftRoleLeader {
 				request := &AppendEntriesArgs{
 					Term:            myTerm,
 					LeaderId:        rf.me,
@@ -242,22 +243,21 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 					Entries:         rf.log[rf.nextIdx[idx]:],
 					LeaderCommitIdx: rf.commitIdx,
 				}
-
 				ok = e.Call(RaftRPCAppendENtries, request, reply)
 				if ok {
 					rf.mu.Lock()
-					if reply.Term > rf.currentTerm {
-						rf.currentTerm = reply.Term
+					rf.currentTerm = Max(reply.Term, rf.currentTerm)
+					if reply.Term > myTerm {
 						rf.role = RaftRoleFollower
 						rf.votedFor = -1
-						rf.mu.Unlock()
-						break
 					}
-					if reply.Success {
-						rf.matchIdx[idx]++
-						rf.nextIdx[idx] = curLogIdx + 1
-					} else {
-						rf.nextIdx[idx]--
+					if reply.Term == myTerm {
+						if reply.Success {
+							rf.matchIdx[idx]++
+							rf.nextIdx[idx] = curLogIdx + 1
+						} else {
+							rf.nextIdx[idx]--
+						}
 					}
 					rf.mu.Unlock()
 				}
@@ -267,7 +267,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	go func(successCh chan bool) {
 		successCnt := 1 // self is consider a success
-		for i := 1; i < len(rf.peers); i++ {
+		for i := 1; i < len(rf.peers) && rf.role == RaftRoleLeader; i++ {
 			if <-successCh {
 				successCnt++
 			}
@@ -283,7 +283,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		}
 	}(successCh)
 
-	return curLogIdx, rf.currentTerm, true
+	if rf.role == RaftRoleLeader {
+		Debug(dTrace, "S%d(T%d) received client call log %v", rf.me, rf.currentTerm, rf.log[len(rf.log)-1])
+	}
+	return curLogIdx, rf.currentTerm, rf.role == RaftRoleLeader
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -361,37 +364,39 @@ func (rf *Raft) tryElection() {
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
 	rf.lastHeartBeat = time.Now()
-	thisTerm := rf.currentTerm
+	myTerm := rf.currentTerm
 	rf.mu.Unlock()
 
-	Debug(dVote, "S%d start an election with T%d", rf.me, thisTerm)
+	Debug(dVote, "S%d start an election with T%d", rf.me, myTerm)
 	request := &RequestVoteArgs{
-		Term:         thisTerm,
+		Term:         myTerm,
 		CandidateId:  rf.me,
 		LastLogIndex: len(rf.log) - 1,
 		LastLogTerm:  rf.log[len(rf.log)-1].Term,
 	}
 	voteCh := make(chan bool)
+	isReverted := false
 	for idx, peer := range rf.peers {
 		if idx == rf.me {
 			continue
 		}
-		go func(e *labrpc.ClientEnd) {
+		go func(e *labrpc.ClientEnd, idx int) {
 			defer func() { voteCh <- false }()
 			reply := &RequestVoteReply{}
 			if ok := e.Call(RaftRPCRequestVote, request, reply); ok {
 				voteCh <- reply.VoteGranted
 				rf.mu.Lock()
-				if reply.Term > rf.currentTerm {
-					Debug(dLeader, "S%d(T%d) meet T%d, revert to follower",
-						rf.me, rf.currentTerm, reply.Term)
-					rf.currentTerm = reply.Term
+				rf.currentTerm = Max(reply.Term, rf.currentTerm)
+				if reply.Term > myTerm && !isReverted {
+					Debug(dLeader, "S%d(T%d) meet S%d(T%d), revert to follower",
+						rf.me, myTerm, idx, reply.Term)
 					rf.role = RaftRoleFollower
 					rf.votedFor = -1
+					isReverted = true
 				}
 				rf.mu.Unlock()
 			}
-		}(peer)
+		}(peer, idx)
 	}
 
 	// count vote
@@ -415,7 +420,7 @@ func (rf *Raft) tryElection() {
 	// be at least as high as the current leader.
 	// 1. If this candidate's term is larger than the leader, there can not be a valid heart bead.
 	// 2. If this candidate's term is smaller than the leader, it can not receive a majority vote.
-	if voteCnt > len(rf.peers)/2 && rf.role == RaftRoleCandidate && thisTerm == rf.currentTerm {
+	if voteCnt > len(rf.peers)/2 && rf.role == RaftRoleCandidate && myTerm == rf.currentTerm {
 		Debug(dLeader, "S%d(T%d) is selected as leader", rf.me, rf.currentTerm)
 		rf.mu.Lock()
 		rf.role = RaftRoleLeader
@@ -432,33 +437,34 @@ func (rf *Raft) tryElection() {
 
 		// send heart beat to followers
 		for rf.role == RaftRoleLeader {
-			rf.mu.Lock()
-			request := &AppendEntriesArgs{
-				Term:            rf.currentTerm,
-				LeaderId:        rf.me,
-				PrevLogIdx:      len(rf.log) - 1, // start with a dummy head
-				PrevLogTerm:     rf.log[len(rf.log)-1].Term,
-				LeaderCommitIdx: rf.commitIdx,
-			}
-			rf.mu.Unlock()
 
 			for idx, peer := range rf.peers {
 				if idx == rf.me {
 					continue
 				}
-				go func(e *labrpc.ClientEnd) {
+				rf.mu.Lock()
+				request := &AppendEntriesArgs{
+					Term:            myTerm,
+					LeaderId:        rf.me,
+					PrevLogIdx:      rf.nextIdx[idx] - 1, // start with a dummy head
+					PrevLogTerm:     rf.log[rf.nextIdx[idx]-1].Term,
+					LeaderCommitIdx: rf.commitIdx,
+				}
+				rf.mu.Unlock()
+				go func(e *labrpc.ClientEnd, idx int) {
 					reply := &AppendEntriesReply{}
 					if ok := e.Call(RaftRPCAppendENtries, request, reply); ok {
 						rf.mu.Lock()
-						if reply.Term > rf.currentTerm {
-							Debug(dTerm, "S%d meet T%d revert to follower", rf.me, reply.Term)
+						if reply.Term > myTerm {
+							Debug(dTerm, "S%d(%d) meet S%d(T%d) revert to follower",
+								rf.me, myTerm, idx, reply.Term)
 							rf.currentTerm = reply.Term
 							rf.votedFor = -1
 							rf.role = RaftRoleFollower
 						}
 						rf.mu.Unlock()
 					}
-				}(peer)
+				}(peer, idx)
 			}
 			time.Sleep(heartBeatIntervalMS * time.Millisecond)
 		}
