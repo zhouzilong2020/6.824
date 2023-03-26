@@ -152,15 +152,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if len(args.Entries) > 0 {
 		Debug(dLog, "S%d(T%d) receive AppendEntries val: %v", rf.me, myTerm, args)
+	} else {
+		Debug(dLog, "S%d(T%d) receive heart beat from S%d(T%d)", rf.me, myTerm, args.LeaderId, args.Term)
 	}
-
 	// reject the request
 	if args.Term < myTerm || // invalid term
 		len(rf.log)-1 < args.PrevLogIdx || // follower does not have that many log entry as leader does
 		rf.log[args.PrevLogIdx].Term != args.PrevLogTerm { // invalid entry
-		if len(args.Entries) > 0 {
-			Debug(dLog, "S%d(T%d) rejected S%d, lastIdx %d", rf.me, myTerm, args.LeaderId, len(rf.log)-1)
-		}
+		// if len(args.Entries) > 0 {
+		Debug(dLog, "S%d(T%d) rejected S%d, lastIdx %d", rf.me, myTerm, args.LeaderId, len(rf.log)-1)
+		// }
 		reply.Success = false
 		return
 	}
@@ -194,8 +195,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if args.LeaderCommitIdx > rf.commitIdx {
+		Debug(dCommit, "S%d(T%d) trigger commit", rf.me, myTerm)
 		rf.commitIdx = Min(args.LeaderCommitIdx, len(rf.log)-1)
-		rf.applyCond.Signal()
+		rf.commitCond.Signal()
 	}
 
 }
@@ -232,9 +234,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			continue
 		}
 		go func(e *labrpc.ClientEnd, idx int, successCh chan bool) {
-			reply := &AppendEntriesReply{}
 			ok := false
+			reply := &AppendEntriesReply{}
 			for (!ok || !reply.Success) && rf.role == RaftRoleLeader {
+				reply.Success = false
+				reply.Term = 0
 				request := &AppendEntriesArgs{
 					Term:            myTerm,
 					LeaderId:        rf.me,
@@ -272,12 +276,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				successCnt++
 			}
 			if successCnt > len(rf.peers)/2 {
+				Debug(dTrace, "S%d(T%d) reach majority", rf.me, myTerm)
 				// commit point, can apply to the state machine,
 				// need to make sure history log applied successfully.
 				rf.mu.Lock()
 				rf.commitIdx = Max(rf.commitIdx, curLogIdx)
 				rf.mu.Unlock()
-				rf.applyCond.Signal()
+				rf.commitCond.Signal()
 				break
 			}
 		}
@@ -437,18 +442,20 @@ func (rf *Raft) tryElection() {
 
 		// send heart beat to followers
 		for rf.role == RaftRoleLeader {
-
+			commitIdx := rf.commitIdx
 			for idx, peer := range rf.peers {
 				if idx == rf.me {
 					continue
 				}
 				rf.mu.Lock()
+				// TODO: here is replica in the START
 				request := &AppendEntriesArgs{
 					Term:            myTerm,
 					LeaderId:        rf.me,
 					PrevLogIdx:      rf.nextIdx[idx] - 1, // start with a dummy head
 					PrevLogTerm:     rf.log[rf.nextIdx[idx]-1].Term,
-					LeaderCommitIdx: rf.commitIdx,
+					Entries:         rf.log[rf.nextIdx[idx]:],
+					LeaderCommitIdx: commitIdx,
 				}
 				rf.mu.Unlock()
 				go func(e *labrpc.ClientEnd, idx int) {
@@ -501,7 +508,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		commitIdx:       0,
 		lastApplied:     0,
 	}
-	rf.applyCond = sync.NewCond(&rf.mu)
+	rf.commitCond = sync.NewCond(&rf.mu)
 
 	// Your initialization code here (2A, 2B, 2C).
 
@@ -511,7 +518,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// run an election when timeout ticker goes off.
 	go rf.timeoutTicker(rf.electionTrigger)
 	go rf.runElection(rf.electionTrigger)
-	go rf.commitLog(rf.applyCond)
+	go rf.commitLog(rf.commitCond)
 
 	return rf
 }

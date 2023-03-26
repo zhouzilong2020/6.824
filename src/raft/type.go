@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -65,7 +66,7 @@ type Raft struct {
 	log         []LogEntry
 	commitIdx   int
 	lastApplied int
-	applyCond   *sync.Cond
+	commitCond  *sync.Cond
 
 	// only for leader
 	nextIdx  []int
@@ -91,6 +92,10 @@ type AppendEntriesArgs struct {
 	PrevLogTerm     int
 	Entries         []LogEntry // empty for heartbeat, may send more than one for efficiency
 	LeaderCommitIdx int
+}
+
+func (args AppendEntriesArgs) String() string {
+	return fmt.Sprintf("T%d, leader%d, prevLogIdx%d, PrevLogTerm%d", args.Term, args.LeaderId, args.PrevLogIdx, args.PrevLogTerm)
 }
 
 type AppendEntriesReply struct {
