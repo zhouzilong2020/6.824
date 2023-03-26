@@ -224,6 +224,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			for !reply.Success && rf.role == RaftRoleLeader {
 				reply.Success = false
 				reply.Term = 0
+				rf.mu.Lock()
 				request := &AppendEntriesArgs{
 					Term:            myTerm,
 					LeaderId:        rf.me,
@@ -232,6 +233,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 					Entries:         rf.log[rf.nextIdx[idx]:],
 					LeaderCommitIdx: rf.commitIdx,
 				}
+				rf.mu.Unlock()
+
 				ok = e.Call(RaftRPCAppendENtries, request, reply)
 				if ok {
 					rf.mu.Lock()
@@ -257,7 +260,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				successCnt++
 			}
 			if successCnt > len(rf.peers)/2 {
-				Debug(dTrace, "S%d(T%d) reach majority", rf.me, myTerm)
+				Debug(dTrace, "S%d(T%d) log%d reach majority", rf.me, myTerm, curLogIdx)
 				// commit point, can apply to the state machine,
 				// need to make sure history log applied successfully.
 				rf.mu.Lock()
