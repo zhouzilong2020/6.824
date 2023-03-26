@@ -189,11 +189,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if args.LeaderCommitIdx > rf.commitIdx {
-		Debug(dCommit, "S%d(T%d) trigger commit", rf.me, myTerm)
 		rf.commitIdx = Min(args.LeaderCommitIdx, len(rf.log)-1)
 		rf.commitCond.Signal()
 	}
-
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -210,18 +208,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
+	// only leader can call applyEntries on followers
 	if rf.role != RaftRoleLeader {
 		rf.mu.Unlock()
 		return -1, rf.currentTerm, false
 	}
 
-	// only leader can call ApplyEntries to other server.
 	newLogEntry := LogEntry{Data: command, Term: rf.currentTerm}
+	// leader first append log entry to its local log.
 	rf.log = append(rf.log, newLogEntry)
 	curLogIdx := len(rf.log) - 1
 	myTerm := rf.currentTerm
 	rf.mu.Unlock()
 
+	Debug(dTrace, "S%d(T%d) received client call %v", rf.me, rf.currentTerm, rf.log[len(rf.log)-1])
 	successCh := make(chan bool)
 	for idx, peer := range rf.peers {
 		if idx == rf.me {
@@ -230,7 +230,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		go func(e *labrpc.ClientEnd, idx int, successCh chan bool) {
 			ok := false
 			reply := &AppendEntriesReply{}
-			for (!ok || !reply.Success) && rf.role == RaftRoleLeader {
+			// There are 3 possible results:
+			// 1. [Invalid leader] follower has a larger term, forcing leader to step down and revert to a follower.
+			// 2. [Network partition] leader can not reach follower, leader will retry indefinitely. (FIXME: is this necessary? will do by a heartbeat)
+			// 3. [Log Inconsistency] follower will reject the request, leader will decrement its prev log index until matched.
+			for !reply.Success && rf.role == RaftRoleLeader {
 				reply.Success = false
 				reply.Term = 0
 				request := &AppendEntriesArgs{
@@ -277,10 +281,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			}
 		}
 	}(successCh)
-
-	if rf.role == RaftRoleLeader {
-		Debug(dTrace, "S%d(T%d) received client call log %v", rf.me, rf.currentTerm, rf.log[len(rf.log)-1])
-	}
 	return curLogIdx, rf.currentTerm, rf.role == RaftRoleLeader
 }
 
@@ -316,6 +316,8 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+// commitLog is a backend running goroutine, that will be awoken when commitIdx is changed.
+// It will try to commit everything between lastApplied and commitIdx to the state machine.
 func (rf *Raft) commitLog(cond *sync.Cond) {
 	for !rf.killed() {
 		rf.mu.Lock()
@@ -471,12 +473,10 @@ func (rf *Raft) tryElection() {
 		}
 	}
 
-	// TODO (is this true?): It is impossible to have a candidate to win an election and
-	// receive a valid heart beat from a leader. In order to receive a majority vote,
-	// candidate's term must be higher than the majority, and the majority's term should
-	// be at least as high as the current leader.
-	// 1. If this candidate's term is larger than the leader, there can not be a valid heart bead.
-	// 2. If this candidate's term is smaller than the leader, it can not receive a majority vote.
+	// win the election only when the following conditions hold:
+	// 1. receive a majority vote.
+	// 2. term has not changed since the beginning of the election.
+	// 3. still a candidate.
 	if voteCnt > len(rf.peers)/2 && rf.role == RaftRoleCandidate && myTerm == rf.currentTerm {
 		Debug(dLeader, "S%d(T%d) is selected as leader", rf.me, rf.currentTerm)
 		rf.mu.Lock()
@@ -485,9 +485,9 @@ func (rf *Raft) tryElection() {
 		rf.nextIdx = make([]int, len(rf.peers))
 		rf.matchIdx = make([]int, len(rf.peers))
 		for idx := range rf.nextIdx {
-			// initialize to leader last log index+1
+			// initialize to leader last log index+1.
 			rf.nextIdx[idx] = len(rf.log)
-			// initialize to 0, increase monotonically
+			// initialize to 0, increase monotonically.
 			rf.matchIdx[idx] = 0
 		}
 		rf.mu.Unlock()
