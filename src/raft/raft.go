@@ -19,12 +19,14 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -46,15 +48,15 @@ func (rf *Raft) GetState() (int, bool) {
 // second argument to persister.Save().
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
+// persist persists Raft states on disk with lock held
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	buff := new(bytes.Buffer)
+	e := labgob.NewEncoder(buff)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	raftState := buff.Bytes()
+	rf.persister.Save(raftState, nil)
 }
 
 // restore previously persisted state.
@@ -62,19 +64,19 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	if err := d.Decode(&rf.currentTerm); err != nil {
+		Debug(dPersist, "S%d fail to read currentTerm from persisted data", rf.me)
+	}
+	if err := d.Decode(&rf.votedFor); err != nil {
+		Debug(dPersist, "S%d fail to read votedFor from persisted data", rf.me)
+	}
+	if err := d.Decode(&rf.log); err != nil {
+		Debug(dPersist, "S%d fail to read log from persisted data", rf.me)
+	}
+	Debug(dPersist, "S%d read persistent states, term %d, votedFor %d, log %v", rf.me, rf.currentTerm, rf.votedFor, rf.log)
 }
 
 // the service says it has created a snapshot that has
@@ -92,12 +94,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// update term
 	myTerm := rf.currentTerm
 	reply.Term = myTerm
-	rf.currentTerm = Max(args.Term, rf.currentTerm)
-	if myTerm < rf.currentTerm {
-		// demoted to follower
-		rf.role = RaftRoleFollower
-		rf.votedFor = -1
-	}
+	rf.checkTerm(args.Term, args.CandidateId)
 
 	reply.VoteGranted = false
 	Debug(dVote, "S%d(T%d) receive vote request from S%d(T%d), voted for S%v",
@@ -120,6 +117,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.role = RaftRoleFollower
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
+		rf.persist()
 	}
 
 	if reply.VoteGranted {
@@ -165,12 +163,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			} else if rf.log[nextIdx].Term != entry.Term {
 				// delete this entry and everything follows it
 				rf.log = rf.log[:nextIdx]
+				rf.persist()
 				isMisMatch = true
 			}
 		}
 
 		if isMisMatch { // mismatch happens, append everything from the args that not already in log.
 			rf.log = append(rf.log, entry)
+			rf.persist()
 			Debug(dLog, "S%d appended log%d %v\n", rf.me, len(rf.log)-1, rf.log[len(rf.log)-1])
 		}
 	}
@@ -204,6 +204,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	newLogEntry := LogEntry{Data: command, Term: rf.currentTerm}
 	// leader first append log entry to its local log.
 	rf.log = append(rf.log, newLogEntry)
+	rf.persist()
 	curLogIdx := len(rf.log) - 1
 	myTerm := rf.currentTerm
 	rf.mu.Unlock()
@@ -295,6 +296,7 @@ func (rf *Raft) checkTerm(term int, serverIdx int) bool {
 			rf.me, rf.currentTerm, serverIdx, term)
 		rf.currentTerm = term
 		rf.votedFor = -1
+		rf.persist()
 		rf.role = RaftRoleFollower
 		return true
 	}
@@ -420,6 +422,7 @@ func (rf *Raft) tryElection() {
 	rf.role = RaftRoleCandidate
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
+	rf.persist()
 	rf.lastHeartBeat = time.Now()
 	myTerm := rf.currentTerm
 	rf.mu.Unlock()
@@ -507,18 +510,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		persister:       persister,
 		me:              me,
 		role:            RaftRoleFollower,
-		votedFor:        -1,
 		lastHeartBeat:   time.Now(),
 		electionTrigger: make(chan bool),
 		applyCh:         applyCh,
-		currentTerm:     0,
-		log:             []LogEntry{{-1, 0} /*dummy head*/},
-		commitIdx:       0,
-		lastApplied:     0,
+		// persist state begin
+		currentTerm: 0,
+		votedFor:    -1,
+		log:         []LogEntry{{-1, 0} /*dummy head*/},
+		// persist state end
+		commitIdx:   0,
+		lastApplied: 0,
 	}
 	rf.commitCond = sync.NewCond(&rf.mu)
-
-	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash.
 	rf.readPersist(persister.ReadRaftState())
