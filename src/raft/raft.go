@@ -19,12 +19,14 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -46,15 +48,15 @@ func (rf *Raft) GetState() (int, bool) {
 // second argument to persister.Save().
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
+// persist persists Raft states on disk with lock held
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	buff := new(bytes.Buffer)
+	e := labgob.NewEncoder(buff)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	raftState := buff.Bytes()
+	rf.persister.Save(raftState, nil)
 }
 
 // restore previously persisted state.
@@ -62,19 +64,19 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	if err := d.Decode(&rf.currentTerm); err != nil {
+		Debug(dPersist, "S%d fail to read currentTerm from persisted data", rf.me)
+	}
+	if err := d.Decode(&rf.votedFor); err != nil {
+		Debug(dPersist, "S%d fail to read votedFor from persisted data", rf.me)
+	}
+	if err := d.Decode(&rf.log); err != nil {
+		Debug(dPersist, "S%d fail to read log from persisted data", rf.me)
+	}
+	Debug(dPersist, "S%d read persistent states, term %d, votedFor %d, log %v", rf.me, rf.currentTerm, rf.votedFor, rf.log)
 }
 
 // the service says it has created a snapshot that has
@@ -92,19 +94,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// update term
 	myTerm := rf.currentTerm
 	reply.Term = myTerm
-	rf.currentTerm = Max(args.Term, rf.currentTerm)
-	if myTerm < rf.currentTerm {
-		// demoted to follower
-		rf.role = RaftRoleFollower
-		rf.votedFor = -1
-	}
+	rf.checkTerm(args.Term, args.CandidateId)
 
 	reply.VoteGranted = false
 	Debug(dVote, "S%d(T%d) receive vote request from S%d(T%d), voted for S%v",
 		rf.me, myTerm, args.CandidateId, args.Term, rf.votedFor)
 	if args.Term < myTerm { // reject vote
-		// Reply false if term < myTerm
-		reply.VoteGranted = false
 		return
 	}
 
@@ -120,6 +115,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.role = RaftRoleFollower
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
+		rf.persist()
 	}
 
 	if reply.VoteGranted {
@@ -135,20 +131,38 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	myTerm := rf.currentTerm
 	reply.Term = myTerm
+	reply.ConflictingTerm = -1
+	reply.LogLen = len(rf.log)
 	rf.checkTerm(args.Term, args.LeaderId)
 	// either initiate by  heartbeat() of Start().
-	Debug(dLog, "S%d(T%d) receive AppendEntries val: %v", rf.me, myTerm, args)
-	// reject the request
+	Debug(dLog, "S%d(T%d) receive AppendEntries val: %v, cur log len: %d", rf.me, myTerm, args, len(rf.log))
+	if args.Term == myTerm {
+		rf.lastHeartBeat = time.Now()
+		Debug(dTimer, "S%d(T%d) update heartbeat %v", rf.me, myTerm, rf.lastHeartBeat)
+	}
+
 	if args.Term < myTerm || // invalid term
 		len(rf.log)-1 < args.PrevLogIdx || // follower does not have that many log entry as leader does
 		rf.log[args.PrevLogIdx].Term != args.PrevLogTerm { // invalid entry
-		Debug(dLog, "S%d(T%d) rejected S%d, lastIdx %d", rf.me, myTerm, args.LeaderId, len(rf.log)-1)
 		reply.Success = false
+		// replying with the conflicting term and idx for leader to set nextIdx faster.
+		if len(rf.log) > args.PrevLogIdx && rf.log[args.PrevLogIdx].Term != args.PrevLogTerm {
+			reply.ConflictingTerm = rf.log[args.PrevLogIdx].Term
+			idx := args.PrevLogIdx
+			for ; 0 <= idx; idx-- {
+				if rf.log[idx].Term != reply.ConflictingTerm {
+					break
+				}
+			}
+			reply.FirstConflictingLogIdx = idx + 1
+		}
+		Debug(dLog2, "S%d(T%d) reject request xTerm %d xIdx %d xLen %d, log%d(T%d)",
+			rf.me, rf.currentTerm, reply.ConflictingTerm, reply.FirstConflictingLogIdx,
+			reply.LogLen, len(rf.log)-1, rf.log[len(rf.log)-1].Term)
+
 		return
 	}
 
-	rf.lastHeartBeat = time.Now()
-	Debug(dTimer, "S%d(T%d) update heartbeat %v", rf.me, myTerm, rf.lastHeartBeat)
 	reply.Success = true
 	if rf.role == RaftRoleCandidate {
 		// recognize this leader, give up the ongoing election on its term (if there is one).
@@ -165,13 +179,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			} else if rf.log[nextIdx].Term != entry.Term {
 				// delete this entry and everything follows it
 				rf.log = rf.log[:nextIdx]
+				rf.persist()
 				isMisMatch = true
 			}
 		}
 
 		if isMisMatch { // mismatch happens, append everything from the args that not already in log.
 			rf.log = append(rf.log, entry)
-			Debug(dLog, "S%d appended log%d %v\n", rf.me, len(rf.log)-1, rf.log[len(rf.log)-1])
+			rf.persist()
 		}
 	}
 
@@ -197,24 +212,26 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	// only leader can call applyEntries on followers
 	if rf.role != RaftRoleLeader {
+		curTerm := rf.currentTerm
 		rf.mu.Unlock()
-		return -1, rf.currentTerm, false
+		return -1, curTerm, false
 	}
 
 	newLogEntry := LogEntry{Data: command, Term: rf.currentTerm}
 	// leader first append log entry to its local log.
 	rf.log = append(rf.log, newLogEntry)
+	rf.persist()
 	curLogIdx := len(rf.log) - 1
 	myTerm := rf.currentTerm
 	rf.mu.Unlock()
 
 	Debug(dTrace, "S%d(T%d) received client call %v", rf.me, rf.currentTerm, rf.log[len(rf.log)-1])
 	successCh := make(chan bool)
-	for idx, peer := range rf.peers {
-		if idx == rf.me {
+	for sId, peer := range rf.peers {
+		if sId == rf.me {
 			continue
 		}
-		go func(e *labrpc.ClientEnd, idx int, successCh chan bool) {
+		go func(e *labrpc.ClientEnd, sId int, successCh chan bool) {
 			ok := false
 			reply := &AppendEntriesReply{}
 			// There are 3 possible results:
@@ -228,30 +245,45 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				request := &AppendEntriesArgs{
 					Term:            myTerm,
 					LeaderId:        rf.me,
-					PrevLogIdx:      rf.nextIdx[idx] - 1, // start with a dummy head
-					PrevLogTerm:     rf.log[rf.nextIdx[idx]-1].Term,
-					Entries:         rf.log[rf.nextIdx[idx]:],
+					PrevLogIdx:      rf.nextIdx[sId] - 1, // start with a dummy head
+					PrevLogTerm:     rf.log[rf.nextIdx[sId]-1].Term,
+					Entries:         rf.log[rf.nextIdx[sId]:],
 					LeaderCommitIdx: rf.commitIdx,
 				}
 				rf.mu.Unlock()
 
 				ok = e.Call(RaftRPCAppendENtries, request, reply)
-				if ok {
+				if ok && rf.role == RaftRoleLeader {
+					if myTerm != reply.Term {
+						reply.Success = false
+						break
+					}
 					rf.mu.Lock()
-					rf.checkTerm(reply.Term, idx)
+					rf.checkTerm(reply.Term, sId)
 					if reply.Term == myTerm {
 						if reply.Success {
-							rf.matchIdx[idx]++
-							rf.nextIdx[idx] = curLogIdx + 1
+							rf.matchIdx[sId] = curLogIdx
+							rf.nextIdx[sId] = curLogIdx + 1
 						} else {
-							rf.nextIdx[idx]--
+							// follower's log is too short
+							rf.nextIdx[sId] = Min(reply.LogLen, rf.nextIdx[sId])
+							if reply.ConflictingTerm != -1 {
+								ok, lastIdx := lastLogIdxWithTerm(rf.log, reply.ConflictingTerm)
+								if ok {
+									rf.nextIdx[sId] = lastIdx
+								} else {
+									rf.nextIdx[sId] = reply.FirstConflictingLogIdx
+								}
+							}
+							Debug(dLog2, "S%d, xTerm %d xIdx %d xLen %d, nextIdx[%d] %d",
+								rf.me, reply.ConflictingTerm, reply.FirstConflictingLogIdx, reply.LogLen, sId, rf.nextIdx[sId])
 						}
 					}
 					rf.mu.Unlock()
 				}
 			}
 			successCh <- reply.Success
-		}(peer, idx, successCh)
+		}(peer, sId, successCh)
 	}
 	go func(successCh chan bool) {
 		successCnt := 1 // self is consider a success
@@ -286,6 +318,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	Debug(dInfo, "S%d(T%d) shut down", rf.me, rf.currentTerm)
 }
 
 // checkTerm will check the term and current term with lock held.
@@ -295,6 +328,7 @@ func (rf *Raft) checkTerm(term int, serverIdx int) bool {
 			rf.me, rf.currentTerm, serverIdx, term)
 		rf.currentTerm = term
 		rf.votedFor = -1
+		rf.persist()
 		rf.role = RaftRoleFollower
 		return true
 	}
@@ -365,54 +399,82 @@ func (rf *Raft) runElection(trigger chan bool) {
 }
 
 func (rf *Raft) heartbeat(myTerm int) {
-	for rf.role == RaftRoleLeader {
+	defer Debug(dLeader, "S%d(T%d) is no longer a leader, stop sending heartbeat", rf.me, rf.currentTerm)
+	for rf.role == RaftRoleLeader && myTerm == rf.currentTerm && !rf.killed() {
 		commitIdx := rf.commitIdx
-		for idx, peer := range rf.peers {
-			if idx == rf.me {
+		for sId, peer := range rf.peers {
+			if sId == rf.me {
 				continue
 			}
 			rf.mu.Lock()
+			curLogIdx := len(rf.log) - 1
 			request := &AppendEntriesArgs{
 				Term:            myTerm,
 				LeaderId:        rf.me,
-				PrevLogIdx:      rf.nextIdx[idx] - 1, // start with a dummy head
-				PrevLogTerm:     rf.log[rf.nextIdx[idx]-1].Term,
-				Entries:         rf.log[rf.nextIdx[idx]:],
+				PrevLogIdx:      rf.nextIdx[sId] - 1, // start with a dummy head
+				PrevLogTerm:     rf.log[rf.nextIdx[sId]-1].Term,
+				Entries:         rf.log[rf.nextIdx[sId]:],
 				LeaderCommitIdx: commitIdx,
 			}
 			rf.mu.Unlock()
-			go func(e *labrpc.ClientEnd, idx int) {
+			go func(e *labrpc.ClientEnd, sId int) {
 				reply := &AppendEntriesReply{}
+
 				if ok := e.Call(RaftRPCAppendENtries, request, reply); ok {
 					rf.mu.Lock()
-					rf.checkTerm(reply.Term, idx)
+					rf.checkTerm(reply.Term, sId)
 					rf.mu.Unlock()
 				}
-			}(peer, idx)
+				if reply.Term == myTerm {
+					Debug(dLog2, "S%d(T%d), heartbeat heard back from S%d xTerm %d xIdx %d xLen %d, nextIdx[%d] %d, master log len %d",
+						rf.me, myTerm, sId, reply.ConflictingTerm, reply.FirstConflictingLogIdx, reply.LogLen, sId, rf.nextIdx[sId], curLogIdx)
+
+					rf.mu.Lock()
+					if reply.Success {
+						rf.matchIdx[sId] = curLogIdx
+						rf.nextIdx[sId] = curLogIdx + 1
+					} else {
+						rf.nextIdx[sId] = Min(reply.LogLen, rf.nextIdx[sId])
+						if reply.ConflictingTerm != -1 {
+							ok, lastIdx := lastLogIdxWithTerm(rf.log, reply.ConflictingTerm)
+							if ok {
+								rf.nextIdx[sId] = lastIdx
+							} else {
+								rf.nextIdx[sId] = reply.FirstConflictingLogIdx
+							}
+						}
+					}
+					rf.mu.Unlock()
+				}
+			}(peer, sId)
 		}
 
 		// last bulletin point in fig.2
-		rf.mu.Lock()
-		oldCommitIdx := rf.commitIdx
-		for i := oldCommitIdx + 1; i < len(rf.log); i++ {
-			matchCnt := 1
-			for _, followerMatchIdx := range rf.matchIdx {
-				if followerMatchIdx >= i {
-					matchCnt++
+		// only commit a previous term's log if there is one log in current term is committed.
+		if myTerm == rf.currentTerm {
+			rf.mu.Lock()
+			oldCommitIdx := rf.commitIdx
+			for i := len(rf.log) - 1; oldCommitIdx < i; i-- {
+				matchCnt := 1
+				for sid := range rf.matchIdx {
+					if rf.matchIdx[sid] >= i && sid != rf.me {
+						matchCnt++
+					}
+				}
+				if matchCnt > len(rf.peers)/2 && rf.log[i].Term == rf.currentTerm {
+					Debug(dLog2, "S%d bump up commitIdx", rf.me)
+					rf.commitIdx = i
+					break
 				}
 			}
-			if matchCnt > len(rf.peers)/2 && rf.log[i].Term == rf.currentTerm {
-				rf.commitIdx = i
+			rf.mu.Unlock()
+			if oldCommitIdx != rf.commitIdx {
+				rf.commitCond.Signal()
 			}
-		}
-		rf.mu.Unlock()
-		if oldCommitIdx != rf.commitIdx {
-			rf.commitCond.Signal()
 		}
 
 		time.Sleep(heartBeatIntervalMS * time.Millisecond)
 	}
-	Debug(dLeader, "S%d(T%d) is no longer a leader, stop sending heartbeat", rf.me, rf.currentTerm)
 }
 
 func (rf *Raft) tryElection() {
@@ -420,11 +482,12 @@ func (rf *Raft) tryElection() {
 	rf.role = RaftRoleCandidate
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
+	rf.persist()
 	rf.lastHeartBeat = time.Now()
 	myTerm := rf.currentTerm
 	rf.mu.Unlock()
 
-	Debug(dVote, "S%d start an election with T%d", rf.me, myTerm)
+	Debug(dVote, "S%d(T%d) start an election", rf.me, myTerm)
 	request := &RequestVoteArgs{
 		Term:         myTerm,
 		CandidateId:  rf.me,
@@ -440,10 +503,14 @@ func (rf *Raft) tryElection() {
 			defer func() { voteCh <- false }()
 			reply := &RequestVoteReply{}
 			if ok := e.Call(RaftRPCRequestVote, request, reply); ok {
-				voteCh <- reply.VoteGranted
 				rf.mu.Lock()
-				rf.checkTerm(reply.Term, idx)
+				isChanged := rf.checkTerm(reply.Term, idx)
 				rf.mu.Unlock()
+				if !isChanged {
+					voteCh <- reply.VoteGranted
+				} else {
+					voteCh <- false
+				}
 			}
 		}(peer, idx)
 	}
@@ -507,21 +574,23 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		persister:       persister,
 		me:              me,
 		role:            RaftRoleFollower,
-		votedFor:        -1,
 		lastHeartBeat:   time.Now(),
 		electionTrigger: make(chan bool),
 		applyCh:         applyCh,
-		currentTerm:     0,
-		log:             []LogEntry{{-1, 0} /*dummy head*/},
-		commitIdx:       0,
-		lastApplied:     0,
+		// persist state begin
+		currentTerm: 0,
+		votedFor:    -1,
+		log:         []LogEntry{{-1, 0} /*dummy head*/},
+		// persist state end
+		commitIdx:   0,
+		lastApplied: 0,
 	}
 	rf.commitCond = sync.NewCond(&rf.mu)
 
-	// Your initialization code here (2A, 2B, 2C).
-
 	// initialize from state persisted before a crash.
 	rf.readPersist(persister.ReadRaftState())
+
+	Debug(dInfo, "S%d(T%d) restarted, peer cnt %d", rf.me, rf.currentTerm, len(rf.peers))
 
 	// run an election when timeout ticker goes off.
 	go rf.timeoutTicker(rf.electionTrigger)

@@ -64,12 +64,12 @@ type Raft struct {
 	electionTrigger chan bool
 	applyCh         chan ApplyMsg // for test only
 
-	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
+	// persistent states begin
 	currentTerm int
 	votedFor    int
 	log         []LogEntry
+	// persistent states end
+
 	commitIdx   int
 	lastApplied int
 	commitCond  *sync.Cond
@@ -108,4 +108,9 @@ func (args AppendEntriesArgs) String() string {
 type AppendEntriesReply struct {
 	Term    int // follower's current term, for leader to update itself
 	Success bool
+
+	// info for leader to fast determine the nextIdx for a follower
+	ConflictingTerm        int
+	FirstConflictingLogIdx int
+	LogLen                 int
 }
