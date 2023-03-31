@@ -282,6 +282,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		// persist state end
 		commitIdx:   0,
 		lastApplied: 0,
+		lastContact: make([]time.Time, len(peers)),
 	}
 	rf.commitCond = sync.NewCond(&rf.mu)
 

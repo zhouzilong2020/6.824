@@ -77,6 +77,8 @@ type Raft struct {
 	// only for leader
 	nextIdx  []int
 	matchIdx []int
+	// lastContact to a follower, if it is recent enough, do not sent heartbeat
+	lastContact []time.Time
 }
 
 type RequestVoteArgs struct {

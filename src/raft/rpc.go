@@ -1,6 +1,10 @@
 package raft
 
-import "6.5840/labrpc"
+import (
+	"time"
+
+	"6.5840/labrpc"
+)
 
 // sendAppendEntries send append entry to peers, and adjust nextIdx & matchIdx according to the reply msg.
 func (rf *Raft) sendAppendEntries(successCh chan bool, retry bool) {
@@ -11,6 +15,10 @@ func (rf *Raft) sendAppendEntries(successCh chan bool, retry bool) {
 		}
 		go func(e *labrpc.ClientEnd, sId int) {
 			reply := &AppendEntriesReply{}
+			// !retry means heartBeat msg
+			if !retry && !time.Now().After(rf.lastContact[sId].Add(heartBeatIntervalMS*time.Millisecond)) {
+				return
+			}
 			// keep retrying if appendEntries is rejected by followers.
 			for !rf.killed() && !reply.Success && rf.role == RaftRoleLeader && myTerm == rf.currentTerm {
 				rf.mu.Lock()
@@ -23,6 +31,7 @@ func (rf *Raft) sendAppendEntries(successCh chan bool, retry bool) {
 					Entries:         rf.log[rf.nextIdx[sId]:],
 					LeaderCommitIdx: rf.commitIdx,
 				}
+				rf.lastContact[sId] = time.Now()
 				rf.mu.Unlock()
 
 				// There are 3 possible results:
