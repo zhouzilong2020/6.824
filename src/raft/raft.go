@@ -54,26 +54,32 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	// update term
 	myTerm := rf.currentTerm
-	reply.Term = myTerm
 	rf.checkTerm(args.Term, args.CandidateId)
+	reply.Term = rf.currentTerm
 
-	reply.VoteGranted = false
-	Debug(dVote, "S%d(T%d) receive vote request from S%d(T%d), voted for S%v",
-		rf.me, myTerm, args.CandidateId, args.Term, rf.votedFor)
+	Debug(dVote, "S%d(T%d) receive vote request from S%d(T%d), last log %d(T%d), voted for S%v",
+		rf.me, myTerm, args.CandidateId, args.Term, len(rf.log), rf.log[len(rf.log)-1].Term, rf.votedFor)
 	if args.Term < myTerm { // reject vote
+		reply.VoteGranted = false
 		return
 	}
 
-	if (args.Term > myTerm || // immediately revert to follower which can grand vote
-		(rf.votedFor == args.CandidateId || rf.votedFor == -1)) &&
-		(args.LastLogTerm > rf.log[len(rf.log)-1].Term || // if candidate's log is more up to date
-			(args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex >= len(rf.log)-1)) {
+	if args.Term > myTerm || rf.votedFor == args.CandidateId || rf.votedFor == -1 { // immediately revert to follower which can grand vote
+		// if candidate's log is more up to date
+		if args.LastLogTerm == rf.log[len(rf.log)-1].Term {
+			if args.LastLogIndex < len(rf.log)-1 {
+				reply.VoteGranted = false
+				return
+			}
+		} else if args.LastLogTerm < rf.log[len(rf.log)-1].Term {
+			reply.VoteGranted = false
+			return
+		}
+
 		// If votedFor is null or candidateId, and candidate’s log is at
 		// least as up-to-date as receiver’s log, grant vote.
 		// If the args.term is larger than current term, meaning this server can vote for another candidate.
 		// there are should be at most 1 vote for one term.
-		Debug(dTerm, "S%d meet T%d", rf.me, args.Term)
-		rf.role = RaftRoleFollower
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
 		rf.persist()
@@ -95,14 +101,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.LogLen = len(rf.log)
 	rf.checkTerm(args.Term, args.LeaderId)
 	// either initiate by  heartbeat() of Start().
+	if args.Term < myTerm { // invalid term
+		return
+	}
+
 	Debug(dLog, "S%d(T%d) receive AppendEntries val: %v, cur log len: %d", rf.me, myTerm, args, len(rf.log))
+
 	if args.Term == myTerm {
 		rf.lastHeartBeat = time.Now()
 		Debug(dTimer, "S%d(T%d) update heartbeat %v", rf.me, myTerm, rf.lastHeartBeat)
 	}
 
-	if args.Term < myTerm || // invalid term
-		len(rf.log)-1 < args.PrevLogIdx || // follower does not have that many log entry as leader does
+	if len(rf.log)-1 < args.PrevLogIdx || // follower does not have that many log entry as leader does
 		rf.log[args.PrevLogIdx].Term != args.PrevLogTerm { // invalid entry
 		reply.Success = false
 		// replying with the conflicting term and idx for leader to set nextIdx faster.
@@ -116,9 +126,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 			reply.FirstConflictingLogIdx = idx + 1
 		}
-		Debug(dLog2, "S%d(T%d) reject request xTerm %d xIdx %d xLen %d, log%d(T%d)",
-			rf.me, rf.currentTerm, reply.ConflictingTerm, reply.FirstConflictingLogIdx,
-			reply.LogLen, len(rf.log)-1, rf.log[len(rf.log)-1].Term)
 		return
 	}
 
@@ -128,25 +135,27 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.role = RaftRoleFollower
 	}
 
-	isMisMatch := false
+	matchIdx := -1
 	for i, entry := range args.Entries {
 		nextIdx := args.PrevLogIdx + i + 1
 		// if there is not a mismatch, do not append
-		if !isMisMatch {
-			if len(rf.log)-1 < nextIdx {
-				isMisMatch = true
-			} else if rf.log[nextIdx].Term != entry.Term {
-				// delete this entry and everything follows it
-				rf.log = rf.log[:nextIdx]
-				rf.persist()
-				isMisMatch = true
-			}
+		if len(rf.log)-1 < nextIdx {
+			matchIdx = i
+		} else if rf.log[nextIdx].Term != entry.Term {
+			// delete this entry and everything follows it
+			rf.log = rf.log[:nextIdx]
+			rf.persist()
+			matchIdx = i
 		}
 
-		if isMisMatch { // mismatch happens, append everything from the args that not already in log.
-			rf.log = append(rf.log, entry)
-			rf.persist()
+		if matchIdx != -1 { // mismatch happens, append everything from the args that not already in log.
+			break
 		}
+	}
+	if matchIdx != -1 {
+		rf.log = append(rf.log, args.Entries[matchIdx:]...)
+		Debug(dLog, "S%d(T%d) appended entries from %d: %v", rf.me, myTerm, matchIdx, args.Entries[matchIdx:])
+		rf.persist()
 	}
 
 	if args.LeaderCommitIdx > rf.commitIdx {
@@ -184,28 +193,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	myTerm := rf.currentTerm
 	rf.mu.Unlock()
 
-	Debug(dTrace, "S%d(T%d) received client call %v", rf.me, rf.currentTerm, rf.log[len(rf.log)-1])
-	successCh := make(chan bool)
-	go rf.sendAppendEntries(successCh, true)
-
-	go func(successCh chan bool) {
-		successCnt := 1 // self is consider a success
-		for i := 1; i < len(rf.peers) && rf.role == RaftRoleLeader; i++ {
-			if <-successCh {
-				successCnt++
-			}
-			if successCnt > len(rf.peers)/2 {
-				Debug(dTrace, "S%d(T%d) log%d reach majority", rf.me, myTerm, curLogIdx)
-				// commit point, can apply to the state machine,
-				// need to make sure history log applied successfully.
-				rf.mu.Lock()
-				rf.commitIdx = Max(rf.commitIdx, curLogIdx)
-				rf.mu.Unlock()
-				rf.commitCond.Signal()
-				break
-			}
-		}
-	}(successCh)
+	Debug(dTrace, "S%d(T%d) received client call log%d[%v]", rf.me, rf.currentTerm, len(rf.log)-1, rf.log[len(rf.log)-1])
+	go rf.sendAppendEntries(myTerm, true)
 
 	return curLogIdx, rf.currentTerm, rf.role == RaftRoleLeader
 }

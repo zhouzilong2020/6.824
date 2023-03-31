@@ -7,8 +7,7 @@ import (
 )
 
 // sendAppendEntries send append entry to peers, and adjust nextIdx & matchIdx according to the reply msg.
-func (rf *Raft) sendAppendEntries(successCh chan bool, retry bool) {
-	myTerm := rf.currentTerm
+func (rf *Raft) sendAppendEntries(myTerm int, retry bool) {
 	for sId, peer := range rf.peers {
 		if sId == rf.me {
 			continue
@@ -44,8 +43,6 @@ func (rf *Raft) sendAppendEntries(successCh chan bool, retry bool) {
 					rf.mu.Unlock()
 				}
 				if reply.Term == myTerm {
-					Debug(dLog2, "S%d(T%d), reply from S%d xTerm %d xIdx %d xLen %d, nextIdx[%d] %d, master log len %d",
-						rf.me, myTerm, sId, reply.ConflictingTerm, reply.FirstConflictingLogIdx, reply.LogLen, sId, rf.nextIdx[sId], curLogIdx)
 					rf.mu.Lock()
 					if reply.Success {
 						rf.matchIdx[sId] = curLogIdx
@@ -64,12 +61,9 @@ func (rf *Raft) sendAppendEntries(successCh chan bool, retry bool) {
 					}
 					rf.mu.Unlock()
 				}
-				if !retry {
+				if !retry || myTerm != reply.Term {
 					break
 				}
-			}
-			if successCh != nil {
-				successCh <- reply.Success
 			}
 		}(peer, sId)
 	}

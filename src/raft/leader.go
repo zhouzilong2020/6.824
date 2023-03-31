@@ -42,7 +42,7 @@ func (rf *Raft) runElection(trigger chan bool) {
 func (rf *Raft) heartbeat(myTerm int) {
 	defer Debug(dLeader, "S%d(T%d) is no longer a leader, stop sending heartbeat", rf.me, rf.currentTerm)
 	for rf.role == RaftRoleLeader && myTerm == rf.currentTerm && !rf.killed() {
-		go rf.sendAppendEntries(nil, false)
+		go rf.sendAppendEntries(myTerm, false)
 		// last bulletin point in fig.2
 		// only commit a previous term's log if there is one log in current term is committed.
 		if myTerm == rf.currentTerm {
@@ -56,7 +56,7 @@ func (rf *Raft) heartbeat(myTerm int) {
 					}
 				}
 				if matchCnt > len(rf.peers)/2 && rf.log[i].Term == rf.currentTerm {
-					Debug(dLog2, "S%d bump up commitIdx", rf.me)
+					Debug(dLog2, "S%d(T%d) bump up commitIdx to %d", rf.me, rf.currentTerm, i)
 					rf.commitIdx = i
 					break
 				}
@@ -81,7 +81,7 @@ func (rf *Raft) tryElection() {
 	myTerm := rf.currentTerm
 	rf.mu.Unlock()
 
-	Debug(dVote, "S%d(T%d) start an election", rf.me, myTerm)
+	Debug(dVote, "S%d(T%d) start an election, last log %d(T%d)", rf.me, myTerm, len(rf.log), rf.log[len(rf.log)-1].Term)
 	request := &RequestVoteArgs{
 		Term:         myTerm,
 		CandidateId:  rf.me,
@@ -89,6 +89,7 @@ func (rf *Raft) tryElection() {
 		LastLogTerm:  rf.log[len(rf.log)-1].Term,
 	}
 	voteCh := make(chan bool)
+	isDiff := false
 	for idx, peer := range rf.peers {
 		if idx == rf.me {
 			continue
@@ -98,11 +99,12 @@ func (rf *Raft) tryElection() {
 			reply := &RequestVoteReply{}
 			if ok := e.Call(RaftRPCRequestVote, request, reply); ok {
 				rf.mu.Lock()
-				isChanged := rf.checkTerm(reply.Term, idx)
+				rf.checkTerm(reply.Term, idx)
 				rf.mu.Unlock()
-				if !isChanged {
+				if reply.Term == myTerm {
 					voteCh <- reply.VoteGranted
 				} else {
+					isDiff = true
 					voteCh <- false
 				}
 			}
@@ -119,7 +121,7 @@ func (rf *Raft) tryElection() {
 			disVoteCnt += 1
 		}
 		if voteCnt > len(rf.peers)/2 ||
-			disVoteCnt > len(rf.peers)/2 {
+			disVoteCnt > len(rf.peers)/2 || isDiff {
 			break
 		}
 	}
@@ -128,7 +130,7 @@ func (rf *Raft) tryElection() {
 	// 1. receive a majority vote.
 	// 2. term has not changed since the beginning of the election.
 	// 3. still a candidate.
-	if voteCnt > len(rf.peers)/2 && rf.role == RaftRoleCandidate && myTerm == rf.currentTerm {
+	if voteCnt > len(rf.peers)/2 && rf.role == RaftRoleCandidate && myTerm == rf.currentTerm && !isDiff {
 		Debug(dLeader, "S%d(T%d) is selected as leader", rf.me, rf.currentTerm)
 		rf.mu.Lock()
 		rf.role = RaftRoleLeader
