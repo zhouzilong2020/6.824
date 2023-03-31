@@ -417,7 +417,8 @@ func (rf *Raft) runElection(trigger chan bool) {
 }
 
 func (rf *Raft) heartbeat(myTerm int) {
-	for rf.role == RaftRoleLeader && myTerm == rf.currentTerm {
+	defer Debug(dLeader, "S%d(T%d) is no longer a leader, stop sending heartbeat", rf.me, rf.currentTerm)
+	for rf.role == RaftRoleLeader && myTerm == rf.currentTerm && !rf.killed() {
 		commitIdx := rf.commitIdx
 		for idx, peer := range rf.peers {
 			if idx == rf.me {
@@ -486,24 +487,26 @@ func (rf *Raft) heartbeat(myTerm int) {
 
 		// last bulletin point in fig.2
 		// only commit a previous term's log if there is one log in current term is committed.
-		rf.mu.Lock()
-		oldCommitIdx := rf.commitIdx
-		for i := len(rf.log) - 1; oldCommitIdx < i; i-- {
-			matchCnt := 1
-			for _, followerMatchIdx := range rf.matchIdx {
-				if followerMatchIdx >= i {
-					matchCnt++
+		if myTerm == rf.currentTerm {
+			rf.mu.Lock()
+			oldCommitIdx := rf.commitIdx
+			for i := len(rf.log) - 1; oldCommitIdx < i; i-- {
+				matchCnt := 1
+				for sid := range rf.matchIdx {
+					if rf.matchIdx[sid] >= i && sid != rf.me {
+						matchCnt++
+					}
+				}
+				if matchCnt > len(rf.peers)/2 && rf.log[i].Term == rf.currentTerm {
+					Debug(dLog2, "S%d bump up commitIdx", rf.me)
+					rf.commitIdx = i
+					break
 				}
 			}
-			if matchCnt > len(rf.peers)/2 && rf.log[i].Term == rf.currentTerm {
-				Debug(dLog2, "S%d bump up commitIdx", rf.me)
-				rf.commitIdx = i
-				break
+			rf.mu.Unlock()
+			if oldCommitIdx != rf.commitIdx {
+				rf.commitCond.Signal()
 			}
-		}
-		rf.mu.Unlock()
-		if oldCommitIdx != rf.commitIdx {
-			rf.commitCond.Signal()
 		}
 
 		time.Sleep(heartBeatIntervalMS * time.Millisecond)
