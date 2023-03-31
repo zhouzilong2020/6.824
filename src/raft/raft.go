@@ -135,7 +135,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.LogLen = len(rf.log)
 	rf.checkTerm(args.Term, args.LeaderId)
 	// either initiate by  heartbeat() of Start().
-	Debug(dLog, "S%d(T%d) receive AppendEntries val: %v", rf.me, myTerm, args)
+	Debug(dLog, "S%d(T%d) receive AppendEntries val: %v, cur log: %v", rf.me, myTerm, args, rf.log)
 	if args.Term == myTerm {
 		rf.lastHeartBeat = time.Now()
 		Debug(dTimer, "S%d(T%d) update heartbeat %v", rf.me, myTerm, rf.lastHeartBeat)
@@ -336,6 +336,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	Debug(dInfo, "S%d(T%d) shut down", rf.me, rf.currentTerm)
 }
 
 // checkTerm will check the term and current term with lock held.
@@ -622,6 +623,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash.
 	rf.readPersist(persister.ReadRaftState())
+
+	Debug(dInfo, "S%d(T%d) restarted", rf.me, rf.currentTerm)
 
 	// run an election when timeout ticker goes off.
 	go rf.timeoutTicker(rf.electionTrigger)
