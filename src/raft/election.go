@@ -42,54 +42,7 @@ func (rf *Raft) runElection(trigger chan bool) {
 func (rf *Raft) heartbeat(myTerm int) {
 	defer Debug(dLeader, "S%d(T%d) is no longer a leader, stop sending heartbeat", rf.me, rf.currentTerm)
 	for rf.role == RaftRoleLeader && myTerm == rf.currentTerm && !rf.killed() {
-		commitIdx := rf.commitIdx
-		for sId, peer := range rf.peers {
-			if sId == rf.me {
-				continue
-			}
-			rf.mu.Lock()
-			curLogIdx := len(rf.log) - 1
-			request := &AppendEntriesArgs{
-				Term:            myTerm,
-				LeaderId:        rf.me,
-				PrevLogIdx:      rf.nextIdx[sId] - 1, // start with a dummy head
-				PrevLogTerm:     rf.log[rf.nextIdx[sId]-1].Term,
-				Entries:         rf.log[rf.nextIdx[sId]:],
-				LeaderCommitIdx: commitIdx,
-			}
-			rf.mu.Unlock()
-			go func(e *labrpc.ClientEnd, sId int) {
-				reply := &AppendEntriesReply{}
-
-				if ok := e.Call(RaftRPCAppendENtries, request, reply); ok {
-					rf.mu.Lock()
-					rf.checkTerm(reply.Term, sId)
-					rf.mu.Unlock()
-				}
-				if reply.Term == myTerm {
-					Debug(dLog2, "S%d(T%d), heartbeat heard back from S%d xTerm %d xIdx %d xLen %d, nextIdx[%d] %d, master log len %d",
-						rf.me, myTerm, sId, reply.ConflictingTerm, reply.FirstConflictingLogIdx, reply.LogLen, sId, rf.nextIdx[sId], curLogIdx)
-
-					rf.mu.Lock()
-					if reply.Success {
-						rf.matchIdx[sId] = curLogIdx
-						rf.nextIdx[sId] = curLogIdx + 1
-					} else {
-						rf.nextIdx[sId] = Min(reply.LogLen, rf.nextIdx[sId])
-						if reply.ConflictingTerm != -1 {
-							ok, lastIdx := lastLogIdxWithTerm(rf.log, reply.ConflictingTerm)
-							if ok {
-								rf.nextIdx[sId] = lastIdx
-							} else {
-								rf.nextIdx[sId] = reply.FirstConflictingLogIdx
-							}
-						}
-					}
-					rf.mu.Unlock()
-				}
-			}(peer, sId)
-		}
-
+		go rf.sendAppendEntries(nil, false)
 		// last bulletin point in fig.2
 		// only commit a previous term's log if there is one log in current term is committed.
 		if myTerm == rf.currentTerm {

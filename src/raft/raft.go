@@ -119,7 +119,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		Debug(dLog2, "S%d(T%d) reject request xTerm %d xIdx %d xLen %d, log%d(T%d)",
 			rf.me, rf.currentTerm, reply.ConflictingTerm, reply.FirstConflictingLogIdx,
 			reply.LogLen, len(rf.log)-1, rf.log[len(rf.log)-1].Term)
-
 		return
 	}
 
@@ -187,64 +186,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	Debug(dTrace, "S%d(T%d) received client call %v", rf.me, rf.currentTerm, rf.log[len(rf.log)-1])
 	successCh := make(chan bool)
-	for sId, peer := range rf.peers {
-		if sId == rf.me {
-			continue
-		}
-		go func(e *labrpc.ClientEnd, sId int, successCh chan bool) {
-			ok := false
-			reply := &AppendEntriesReply{}
-			// There are 3 possible results:
-			// 1. [Invalid leader] follower has a larger term, forcing leader to step down and revert to a follower.
-			// 2. [Network partition] leader can not reach follower, leader will retry indefinitely. (FIXME: is this necessary? will do by a heartbeat)
-			// 3. [Log Inconsistency] follower will reject the request, leader will decrement its prev log index until matched.
-			for !reply.Success && rf.role == RaftRoleLeader {
-				reply.Success = false
-				reply.Term = 0
-				rf.mu.Lock()
-				request := &AppendEntriesArgs{
-					Term:            myTerm,
-					LeaderId:        rf.me,
-					PrevLogIdx:      rf.nextIdx[sId] - 1, // start with a dummy head
-					PrevLogTerm:     rf.log[rf.nextIdx[sId]-1].Term,
-					Entries:         rf.log[rf.nextIdx[sId]:],
-					LeaderCommitIdx: rf.commitIdx,
-				}
-				rf.mu.Unlock()
-
-				ok = e.Call(RaftRPCAppendENtries, request, reply)
-				if ok && rf.role == RaftRoleLeader {
-					if myTerm != reply.Term {
-						reply.Success = false
-						break
-					}
-					rf.mu.Lock()
-					rf.checkTerm(reply.Term, sId)
-					if reply.Term == myTerm {
-						if reply.Success {
-							rf.matchIdx[sId] = curLogIdx
-							rf.nextIdx[sId] = curLogIdx + 1
-						} else {
-							// follower's log is too short
-							rf.nextIdx[sId] = Min(reply.LogLen, rf.nextIdx[sId])
-							if reply.ConflictingTerm != -1 {
-								ok, lastIdx := lastLogIdxWithTerm(rf.log, reply.ConflictingTerm)
-								if ok {
-									rf.nextIdx[sId] = lastIdx
-								} else {
-									rf.nextIdx[sId] = reply.FirstConflictingLogIdx
-								}
-							}
-							Debug(dLog2, "S%d, xTerm %d xIdx %d xLen %d, nextIdx[%d] %d",
-								rf.me, reply.ConflictingTerm, reply.FirstConflictingLogIdx, reply.LogLen, sId, rf.nextIdx[sId])
-						}
-					}
-					rf.mu.Unlock()
-				}
-			}
-			successCh <- reply.Success
-		}(peer, sId, successCh)
-	}
+	go rf.sendAppendEntries(successCh, true)
 
 	go func(successCh chan bool) {
 		successCnt := 1 // self is consider a success
@@ -264,6 +206,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			}
 		}
 	}(successCh)
+
 	return curLogIdx, rf.currentTerm, rf.role == RaftRoleLeader
 }
 
