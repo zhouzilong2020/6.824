@@ -17,7 +17,7 @@ Summary: 4 labs for practice.
 - [X] lab1: Map Reduce with fail recovery
 - [X] lab2A: Raft election
 - [X] lab2B: Raft log replication
-- [ ] lab2C
+- [X] lab2C: Raft persist with optimization with catchup logic, improve heartbeat
 - [ ] lab2D
 - [ ] lab3A
 - [ ] lab3B
