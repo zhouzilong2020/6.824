@@ -74,6 +74,7 @@ type Raft struct {
 	lastApplied int
 	commitCond  *sync.Cond
 
+
 	// only for leader
 	nextIdx  []int
 	matchIdx []int

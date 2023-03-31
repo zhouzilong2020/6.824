@@ -18,14 +18,10 @@ package raft
 //
 
 import (
-	//	"bytes"
-
 	"sync"
 	"sync/atomic"
 	"time"
-
-	//	"6.5840/labgob"
-
+  
 	"6.5840/labrpc"
 )
 
@@ -106,7 +102,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	Debug(dLog, "S%d(T%d) receive AppendEntries val: %v, cur log len: %d", rf.me, myTerm, args, len(rf.log))
-
 	if args.Term == myTerm {
 		rf.lastHeartBeat = time.Now()
 		Debug(dTimer, "S%d(T%d) update heartbeat %v", rf.me, myTerm, rf.lastHeartBeat)
@@ -195,7 +190,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	Debug(dTrace, "S%d(T%d) received client call log%d[%v]", rf.me, rf.currentTerm, len(rf.log)-1, rf.log[len(rf.log)-1])
 	go rf.sendAppendEntries(myTerm, true)
-
 	return curLogIdx, rf.currentTerm, rf.role == RaftRoleLeader
 }
 
