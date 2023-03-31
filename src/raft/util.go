@@ -1,5 +1,19 @@
 package raft
 
+// checkTerm will check the term and current term with lock held.
+func (rf *Raft) checkTerm(term int, serverIdx int) bool {
+	if term > rf.currentTerm {
+		Debug(dTerm, "S%d(%d) meet S%d(T%d) revert to follower",
+			rf.me, rf.currentTerm, serverIdx, term)
+		rf.currentTerm = term
+		rf.votedFor = -1
+		rf.persist()
+		rf.role = RaftRoleFollower
+		return true
+	}
+	return false
+}
+
 // lastLogIdxWithTerm use binary search to find the last entry that has the same term as input.
 // if there is none, return false.
 func lastLogIdxWithTerm(log []LogEntry, term int) (bool, int) {
