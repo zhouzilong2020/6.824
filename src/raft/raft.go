@@ -268,33 +268,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 							// follower's log is too short
 							rf.nextIdx[sId] = Min(reply.LogLen, rf.nextIdx[sId])
 							if reply.ConflictingTerm != -1 {
-								idx := rf.nextIdx[sId] - 1
-								isFound := true
-								for rf.log[idx].Term != reply.ConflictingTerm {
-									if rf.log[idx].Term > reply.ConflictingTerm {
-										idx--
-									} else {
-										idx++
-									}
-									if idx < 0 || idx >= len(rf.log) {
-										isFound = false
-										break
-									}
-								}
-								// leader does not have the term that follower has, all log should be erase.
-								if isFound {
-									for idx < len(rf.log) && rf.log[idx].Term == reply.ConflictingTerm {
-										idx++
-									}
-									rf.nextIdx[sId] = idx - 1
+								ok, lastIdx := lastLogIdxWithTerm(rf.log, reply.ConflictingTerm)
+								if ok {
+									rf.nextIdx[sId] = lastIdx
 								} else {
-									// leader has the term that follower has, set nextIdx to the last log
 									rf.nextIdx[sId] = reply.FirstConflictingLogIdx
 								}
 							}
 							Debug(dLog2, "S%d, xTerm %d xIdx %d xLen %d, nextIdx[%d] %d",
 								rf.me, reply.ConflictingTerm, reply.FirstConflictingLogIdx, reply.LogLen, sId, rf.nextIdx[sId])
-
 						}
 					}
 					rf.mu.Unlock()
@@ -420,8 +402,8 @@ func (rf *Raft) heartbeat(myTerm int) {
 	defer Debug(dLeader, "S%d(T%d) is no longer a leader, stop sending heartbeat", rf.me, rf.currentTerm)
 	for rf.role == RaftRoleLeader && myTerm == rf.currentTerm && !rf.killed() {
 		commitIdx := rf.commitIdx
-		for idx, peer := range rf.peers {
-			if idx == rf.me {
+		for sId, peer := range rf.peers {
+			if sId == rf.me {
 				continue
 			}
 			rf.mu.Lock()
@@ -429,9 +411,9 @@ func (rf *Raft) heartbeat(myTerm int) {
 			request := &AppendEntriesArgs{
 				Term:            myTerm,
 				LeaderId:        rf.me,
-				PrevLogIdx:      rf.nextIdx[idx] - 1, // start with a dummy head
-				PrevLogTerm:     rf.log[rf.nextIdx[idx]-1].Term,
-				Entries:         rf.log[rf.nextIdx[idx]:],
+				PrevLogIdx:      rf.nextIdx[sId] - 1, // start with a dummy head
+				PrevLogTerm:     rf.log[rf.nextIdx[sId]-1].Term,
+				Entries:         rf.log[rf.nextIdx[sId]:],
 				LeaderCommitIdx: commitIdx,
 			}
 			rf.mu.Unlock()
@@ -444,45 +426,27 @@ func (rf *Raft) heartbeat(myTerm int) {
 					rf.mu.Unlock()
 				}
 				if reply.Term == myTerm {
+					Debug(dLog2, "S%d(T%d), heartbeat heard back from S%d xTerm %d xIdx %d xLen %d, nextIdx[%d] %d, master log len %d",
+						rf.me, myTerm, sId, reply.ConflictingTerm, reply.FirstConflictingLogIdx, reply.LogLen, sId, rf.nextIdx[sId], curLogIdx)
+
 					rf.mu.Lock()
 					if reply.Success {
 						rf.matchIdx[sId] = curLogIdx
 						rf.nextIdx[sId] = curLogIdx + 1
 					} else {
-						Debug(dLog2, "S%d, xTerm %d xIdx %d xLen %d, nextIdx[%d] %d, master log len %d",
-							rf.me, reply.ConflictingTerm, reply.FirstConflictingLogIdx, reply.LogLen, sId, rf.nextIdx[sId], curLogIdx)
+						rf.nextIdx[sId] = Min(reply.LogLen, rf.nextIdx[sId])
 						if reply.ConflictingTerm != -1 {
-							idx := rf.nextIdx[sId] - 1
-							isFound := true
-							for rf.log[idx].Term != reply.ConflictingTerm {
-								if rf.log[idx].Term > reply.ConflictingTerm {
-									idx--
-								} else {
-									idx++
-								}
-								if idx < 0 || idx >= len(rf.log) {
-									isFound = false
-									break
-								}
-							}
-							// leader does not have the term that follower has, all log should be erase.
-							if isFound {
-								for idx < len(rf.log) && rf.log[idx].Term == reply.ConflictingTerm {
-									idx++
-								}
-								rf.nextIdx[sId] = idx - 1
+							ok, lastIdx := lastLogIdxWithTerm(rf.log, reply.ConflictingTerm)
+							if ok {
+								rf.nextIdx[sId] = lastIdx
 							} else {
-								// leader has the term that follower has, set nextIdx to the last log
 								rf.nextIdx[sId] = reply.FirstConflictingLogIdx
 							}
 						}
-
-						// follower's log is too short
-						rf.nextIdx[sId] = Min(reply.LogLen, rf.nextIdx[sId])
 					}
 					rf.mu.Unlock()
 				}
-			}(peer, idx)
+			}(peer, sId)
 		}
 
 		// last bulletin point in fig.2
@@ -511,7 +475,6 @@ func (rf *Raft) heartbeat(myTerm int) {
 
 		time.Sleep(heartBeatIntervalMS * time.Millisecond)
 	}
-	Debug(dLeader, "S%d(T%d) is no longer a leader, stop sending heartbeat", rf.me, rf.currentTerm)
 }
 
 func (rf *Raft) tryElection() {
