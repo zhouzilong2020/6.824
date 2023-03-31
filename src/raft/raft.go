@@ -136,7 +136,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.checkTerm(args.Term, args.LeaderId)
 	// either initiate by  heartbeat() of Start().
 	Debug(dLog, "S%d(T%d) receive AppendEntries val: %v", rf.me, myTerm, args)
-	// reject the request
+	if args.Term == myTerm {
+		rf.lastHeartBeat = time.Now()
+		Debug(dTimer, "S%d(T%d) update heartbeat %v", rf.me, myTerm, rf.lastHeartBeat)
+	}
+
 	if args.Term < myTerm || // invalid term
 		len(rf.log)-1 < args.PrevLogIdx || // follower does not have that many log entry as leader does
 		rf.log[args.PrevLogIdx].Term != args.PrevLogTerm { // invalid entry
@@ -145,8 +149,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	rf.lastHeartBeat = time.Now()
-	Debug(dTimer, "S%d(T%d) update heartbeat %v", rf.me, myTerm, rf.lastHeartBeat)
 	reply.Success = true
 	if rf.role == RaftRoleCandidate {
 		// recognize this leader, give up the ongoing election on its term (if there is one).
@@ -237,7 +239,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				rf.mu.Unlock()
 
 				ok = e.Call(RaftRPCAppendENtries, request, reply)
-				if ok {
+				if ok && rf.role == RaftRoleLeader {
+					if myTerm != reply.Term {
+						reply.Success = false
+						break
+					}
 					rf.mu.Lock()
 					rf.checkTerm(reply.Term, idx)
 					if reply.Term == myTerm {
@@ -367,7 +373,7 @@ func (rf *Raft) runElection(trigger chan bool) {
 }
 
 func (rf *Raft) heartbeat(myTerm int) {
-	for rf.role == RaftRoleLeader {
+	for rf.role == RaftRoleLeader && myTerm == rf.currentTerm {
 		commitIdx := rf.commitIdx
 		for idx, peer := range rf.peers {
 			if idx == rf.me {
@@ -443,10 +449,14 @@ func (rf *Raft) tryElection() {
 			defer func() { voteCh <- false }()
 			reply := &RequestVoteReply{}
 			if ok := e.Call(RaftRPCRequestVote, request, reply); ok {
-				voteCh <- reply.VoteGranted
 				rf.mu.Lock()
-				rf.checkTerm(reply.Term, idx)
+				isChanged := rf.checkTerm(reply.Term, idx)
 				rf.mu.Unlock()
+				if !isChanged {
+					voteCh <- reply.VoteGranted
+				} else {
+					voteCh <- false
+				}
 			}
 		}(peer, idx)
 	}
