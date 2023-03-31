@@ -107,4 +107,9 @@ func (args AppendEntriesArgs) String() string {
 type AppendEntriesReply struct {
 	Term    int // follower's current term, for leader to update itself
 	Success bool
+
+	// info for leader to fast determine the nextIdx for a follower
+	ConflictingTerm        int
+	FirstConflictingLogIdx int
+	LogLen                 int
 }

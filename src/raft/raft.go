@@ -100,8 +100,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	Debug(dVote, "S%d(T%d) receive vote request from S%d(T%d), voted for S%v",
 		rf.me, myTerm, args.CandidateId, args.Term, rf.votedFor)
 	if args.Term < myTerm { // reject vote
-		// Reply false if term < myTerm
-		reply.VoteGranted = false
 		return
 	}
 
@@ -133,6 +131,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	myTerm := rf.currentTerm
 	reply.Term = myTerm
+	reply.ConflictingTerm = -1
+	reply.LogLen = len(rf.log)
 	rf.checkTerm(args.Term, args.LeaderId)
 	// either initiate by  heartbeat() of Start().
 	Debug(dLog, "S%d(T%d) receive AppendEntries val: %v", rf.me, myTerm, args)
@@ -144,8 +144,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < myTerm || // invalid term
 		len(rf.log)-1 < args.PrevLogIdx || // follower does not have that many log entry as leader does
 		rf.log[args.PrevLogIdx].Term != args.PrevLogTerm { // invalid entry
-		Debug(dLog, "S%d(T%d) rejected S%d, lastIdx %d", rf.me, myTerm, args.LeaderId, len(rf.log)-1)
 		reply.Success = false
+		// replying with the conflicting term and idx for leader to set nextIdx faster.
+		if len(rf.log) > args.PrevLogIdx && rf.log[args.PrevLogIdx].Term != args.PrevLogTerm {
+			reply.ConflictingTerm = rf.log[args.PrevLogIdx].Term
+			idx := args.PrevLogIdx
+			for ; 0 <= idx; idx-- {
+				if rf.log[idx].Term != reply.ConflictingTerm {
+					break
+				}
+			}
+			reply.FirstConflictingLogIdx = idx + 1
+		}
+		Debug(dLog2, "S%d(T%d) reject request xTerm %d xIdx %d xLen %d, log%d(T%d)",
+			rf.me, rf.currentTerm, reply.ConflictingTerm, reply.FirstConflictingLogIdx,
+			reply.LogLen, len(rf.log)-1, rf.log[len(rf.log)-1].Term)
+
 		return
 	}
 
@@ -173,7 +187,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if isMisMatch { // mismatch happens, append everything from the args that not already in log.
 			rf.log = append(rf.log, entry)
 			rf.persist()
-			Debug(dLog, "S%d appended log%d %v\n", rf.me, len(rf.log)-1, rf.log[len(rf.log)-1])
 		}
 	}
 
@@ -199,8 +212,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	// only leader can call applyEntries on followers
 	if rf.role != RaftRoleLeader {
+		curTerm := rf.currentTerm
 		rf.mu.Unlock()
-		return -1, rf.currentTerm, false
+		return -1, curTerm, false
 	}
 
 	newLogEntry := LogEntry{Data: command, Term: rf.currentTerm}
@@ -213,11 +227,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	Debug(dTrace, "S%d(T%d) received client call %v", rf.me, rf.currentTerm, rf.log[len(rf.log)-1])
 	successCh := make(chan bool)
-	for idx, peer := range rf.peers {
-		if idx == rf.me {
+	for sId, peer := range rf.peers {
+		if sId == rf.me {
 			continue
 		}
-		go func(e *labrpc.ClientEnd, idx int, successCh chan bool) {
+		go func(e *labrpc.ClientEnd, sId int, successCh chan bool) {
 			ok := false
 			reply := &AppendEntriesReply{}
 			// There are 3 possible results:
@@ -231,9 +245,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				request := &AppendEntriesArgs{
 					Term:            myTerm,
 					LeaderId:        rf.me,
-					PrevLogIdx:      rf.nextIdx[idx] - 1, // start with a dummy head
-					PrevLogTerm:     rf.log[rf.nextIdx[idx]-1].Term,
-					Entries:         rf.log[rf.nextIdx[idx]:],
+					PrevLogIdx:      rf.nextIdx[sId] - 1, // start with a dummy head
+					PrevLogTerm:     rf.log[rf.nextIdx[sId]-1].Term,
+					Entries:         rf.log[rf.nextIdx[sId]:],
 					LeaderCommitIdx: rf.commitIdx,
 				}
 				rf.mu.Unlock()
@@ -245,20 +259,49 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 						break
 					}
 					rf.mu.Lock()
-					rf.checkTerm(reply.Term, idx)
+					rf.checkTerm(reply.Term, sId)
 					if reply.Term == myTerm {
 						if reply.Success {
-							rf.matchIdx[idx]++
-							rf.nextIdx[idx] = curLogIdx + 1
+							rf.matchIdx[sId] = curLogIdx
+							rf.nextIdx[sId] = curLogIdx + 1
 						} else {
-							rf.nextIdx[idx]--
+							// follower's log is too short
+							rf.nextIdx[sId] = Min(reply.LogLen, rf.nextIdx[sId])
+							if reply.ConflictingTerm != -1 {
+								idx := rf.nextIdx[sId] - 1
+								isFound := true
+								for rf.log[idx].Term != reply.ConflictingTerm {
+									if rf.log[idx].Term > reply.ConflictingTerm {
+										idx--
+									} else {
+										idx++
+									}
+									if idx < 0 || idx >= len(rf.log) {
+										isFound = false
+										break
+									}
+								}
+								// leader does not have the term that follower has, all log should be erase.
+								if isFound {
+									for idx < len(rf.log) && rf.log[idx].Term == reply.ConflictingTerm {
+										idx++
+									}
+									rf.nextIdx[sId] = idx - 1
+								} else {
+									// leader has the term that follower has, set nextIdx to the last log
+									rf.nextIdx[sId] = reply.FirstConflictingLogIdx
+								}
+							}
+							Debug(dLog2, "S%d, xTerm %d xIdx %d xLen %d, nextIdx[%d] %d",
+								rf.me, reply.ConflictingTerm, reply.FirstConflictingLogIdx, reply.LogLen, sId, rf.nextIdx[sId])
+
 						}
 					}
 					rf.mu.Unlock()
 				}
 			}
 			successCh <- reply.Success
-		}(peer, idx, successCh)
+		}(peer, sId, successCh)
 	}
 	go func(successCh chan bool) {
 		successCnt := 1 // self is consider a success
@@ -380,6 +423,7 @@ func (rf *Raft) heartbeat(myTerm int) {
 				continue
 			}
 			rf.mu.Lock()
+			curLogIdx := len(rf.log) - 1
 			request := &AppendEntriesArgs{
 				Term:            myTerm,
 				LeaderId:        rf.me,
@@ -389,20 +433,61 @@ func (rf *Raft) heartbeat(myTerm int) {
 				LeaderCommitIdx: commitIdx,
 			}
 			rf.mu.Unlock()
-			go func(e *labrpc.ClientEnd, idx int) {
+			go func(e *labrpc.ClientEnd, sId int) {
 				reply := &AppendEntriesReply{}
+
 				if ok := e.Call(RaftRPCAppendENtries, request, reply); ok {
 					rf.mu.Lock()
-					rf.checkTerm(reply.Term, idx)
+					rf.checkTerm(reply.Term, sId)
+					rf.mu.Unlock()
+				}
+				if reply.Term == myTerm {
+					rf.mu.Lock()
+					if reply.Success {
+						rf.matchIdx[sId] = curLogIdx
+						rf.nextIdx[sId] = curLogIdx + 1
+					} else {
+						Debug(dLog2, "S%d, xTerm %d xIdx %d xLen %d, nextIdx[%d] %d, master log len %d",
+							rf.me, reply.ConflictingTerm, reply.FirstConflictingLogIdx, reply.LogLen, sId, rf.nextIdx[sId], curLogIdx)
+						if reply.ConflictingTerm != -1 {
+							idx := rf.nextIdx[sId] - 1
+							isFound := true
+							for rf.log[idx].Term != reply.ConflictingTerm {
+								if rf.log[idx].Term > reply.ConflictingTerm {
+									idx--
+								} else {
+									idx++
+								}
+								if idx < 0 || idx >= len(rf.log) {
+									isFound = false
+									break
+								}
+							}
+							// leader does not have the term that follower has, all log should be erase.
+							if isFound {
+								for idx < len(rf.log) && rf.log[idx].Term == reply.ConflictingTerm {
+									idx++
+								}
+								rf.nextIdx[sId] = idx - 1
+							} else {
+								// leader has the term that follower has, set nextIdx to the last log
+								rf.nextIdx[sId] = reply.FirstConflictingLogIdx
+							}
+						}
+
+						// follower's log is too short
+						rf.nextIdx[sId] = Min(reply.LogLen, rf.nextIdx[sId])
+					}
 					rf.mu.Unlock()
 				}
 			}(peer, idx)
 		}
 
 		// last bulletin point in fig.2
+		// only commit a previous term's log if there is one log in current term is committed.
 		rf.mu.Lock()
 		oldCommitIdx := rf.commitIdx
-		for i := oldCommitIdx + 1; i < len(rf.log); i++ {
+		for i := len(rf.log) - 1; oldCommitIdx < i; i-- {
 			matchCnt := 1
 			for _, followerMatchIdx := range rf.matchIdx {
 				if followerMatchIdx >= i {
@@ -410,7 +495,9 @@ func (rf *Raft) heartbeat(myTerm int) {
 				}
 			}
 			if matchCnt > len(rf.peers)/2 && rf.log[i].Term == rf.currentTerm {
+				Debug(dLog2, "S%d bump up commitIdx", rf.me)
 				rf.commitIdx = i
+				break
 			}
 		}
 		rf.mu.Unlock()
@@ -433,7 +520,7 @@ func (rf *Raft) tryElection() {
 	myTerm := rf.currentTerm
 	rf.mu.Unlock()
 
-	Debug(dVote, "S%d start an election with T%d", rf.me, myTerm)
+	Debug(dVote, "S%d(T%d) start an election", rf.me, myTerm)
 	request := &RequestVoteArgs{
 		Term:         myTerm,
 		CandidateId:  rf.me,
